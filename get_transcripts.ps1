@@ -112,7 +112,7 @@ foreach ($file in $vttFiles) {
         Write-Host "  [download] $fileName" -ForegroundColor Green
         $succeeded++
     } catch {
-        Write-Host "  [error]    $fileName — $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  [error]    $fileName - $($_.Exception.Message)" -ForegroundColor Red
         $failed++
     }
 }
