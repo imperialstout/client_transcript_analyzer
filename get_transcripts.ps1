@@ -42,7 +42,7 @@ Import-Module PnP.PowerShell -ErrorAction Stop
 # Connect (interactive browser login — uses your existing M365 session)
 # ---------------------------------------------------------------------------
 Write-Host "Connecting to $SiteUrl ..." -ForegroundColor Cyan
-Connect-PnPOnline -Url $SiteUrl -Interactive
+Connect-PnPOnline -Url $SiteUrl -DeviceLogin
 
 # ---------------------------------------------------------------------------
 # Recursively find all .vtt files under LibraryPath
