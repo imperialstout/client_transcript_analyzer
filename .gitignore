@@ -1,0 +1,8 @@
+client_context/*
+!client_context/README.txt
+output/
+.env
+*.pyc
+__pycache__/
+.venv/
+venv/
