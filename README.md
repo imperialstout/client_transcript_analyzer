@@ -31,9 +31,16 @@ pip install -r requirements.txt
 
 **2. Create config file**
 
+Windows (PowerShell):
+
+```powershell
+Copy-Item .env.example .env
+```
+
+macOS/Linux:
+
 ```bash
-mkdir -p ~/.config/client-transcript-analyzer
-cp .env.example ~/.config/client-transcript-analyzer/.env
+cp .env.example .env
 ```
 
 Edit the `.env`:
@@ -44,13 +51,15 @@ TRANSCRIPTS_PATH=/path/to/transcripts
 OUTPUT_PATH=./output          # optional, defaults to ./output
 ```
 
+The scripts now load `.env` from the project root first. The old `~/.config/client-transcript-analyzer/.env` location is only a fallback for legacy setups.
+
 **3. Populate `client_context/` (gitignored — copy manually)**
 
 | File | Contents |
 |------|---------|
 | `program_brief.txt` | `Program_Context_Brief.md` from Workcall Drive |
 | `rolodex.txt` | `04_people_rolodex.md` from Workcall Drive |
-| `solution_prompt.txt` | SOLUTION prompt block from `PromptLibrary.md` (optional — fallback prompt used if absent) |
+| `solution_prompt.txt` | SOLUTION prompt block from `PromptLibrary.md` (optional). `analyze.py` uses this as the core transcript extraction prompt; `analyze_uc.py` includes it as additional global guidance if present. |
 
 **4. Copy backlog CSVs into `client_data/`** (gitignored)
 
@@ -67,7 +76,9 @@ client_data/
 
 ## analyze_uc.py — Use-Case Pipeline
 
-Designed for transcripts organized into feature folders (e.g. `1.04 Catalogue and Pricebook/`). Matches folders to backlog features by numeric prefix, analyzes each transcript with the feature definition injected as context, and produces a gap report against the full backlog.
+Designed for transcripts organized under immediate subfolders of `TRANSCRIPTS_PATH` (for example `1.04 Catalogue and Pricebook/`). Folders with numeric prefixes are matched to backlog features, while unmatched folders are still analyzed and reported as unmatched in the gap report.
+
+Files directly under `TRANSCRIPTS_PATH` are also analyzed under a synthetic `ROOT` bucket.
 
 **Expected `TRANSCRIPTS_PATH` layout:**
 
@@ -84,11 +95,19 @@ TRANSCRIPTS_PATH/
 
 Folder names are matched by the leading numeric prefix (`1.04`, `2.01`, etc.) — exact name or typos after the prefix don't matter.
 
+Accepted transcript formats are `.vtt` and `.txt`.
+
 **Commands:**
 
 ```bash
 # Check coverage before running any API calls
 python analyze_uc.py --gap-only
+
+# Quality-check transcript text before running API calls
+python analyze_uc.py --qc-only
+
+# Block low-quality transcripts from analysis (example threshold: 70)
+python analyze_uc.py --qc-threshold 70
 
 # Full pipeline: analyze all features, generate UC summaries + gap report
 python analyze_uc.py
@@ -105,16 +124,81 @@ python analyze_uc.py --summary-only
 ```
 output/
   features/
-    1.04 Catalogue and Pricebook/
+    1.04/
       recording1 [ANALYZED].txt       ← per-transcript extraction
+      recording1 [ANALYZED].meta.json ← cache/status metadata
     [FEATURE SUMMARY] 1.04 Catalogue and Pricebook.md
   [UC SUMMARY] UC0.md                 ← synthesized across all in-scope features
   [UC SUMMARY] UC1.md
   [UC SUMMARY] UC2.md
   [GAP REPORT] coverage.md            ← which backlog rows have no transcripts
+  [QC REPORT] transcript_quality.md   ← transcript quality heuristics (no API calls)
+  logs/
+    run_<timestamp>.log               ← full console output for the run
+    errors_<timestamp>.log            ← stderr/errors only
 ```
 
 **Start here.** Run `--gap-only` first to see what you have before spending any API quota.
+
+### How "already processed" is determined
+
+`analyze_uc.py` now uses metadata sidecars (`[ANALYZED].meta.json`) for each transcript.
+
+A transcript is skipped only when all of the following still match:
+
+- source file hash (SHA-256)
+- source file size and modification timestamp
+- transcript model (`MODEL_TRANSCRIPT`)
+- prompt/context signature (includes base context + `solution_prompt.txt` guidance)
+
+If any of those change, the transcript is automatically reprocessed.
+
+### Transcript quality pre-check (`--qc-only`)
+
+`analyze_uc.py --qc-only` scans the same transcript set the pipeline would process (matched feature folders, unmatched folders, and root-level `.vtt`/`.txt` files) and writes:
+
+- `output/[QC REPORT] transcript_quality.md`
+
+The report assigns a heuristic quality score (`good` / `watch` / `poor`) using signals like:
+
+- very short parsed text
+- low word count
+- repeated transcript lines
+- frequent `inaudible`/`unclear` markers
+
+Use this to identify transcripts that should be re-transcribed or manually reviewed before spending model quota.
+
+### Run logs
+
+`analyze_uc.py` now writes two log files under `output/logs/` for each run:
+
+- `run_<timestamp>.log` — full run output including progress, skips, summaries, and errors
+- `errors_<timestamp>.log` — error stream only
+
+The script prints both log paths at startup.
+
+### Transcript quality gate (`--qc-threshold`)
+
+Use `--qc-threshold <0-100>` to prevent low-quality transcripts from being sent to the model at all.
+
+Example:
+
+```bash
+python analyze_uc.py --qc-threshold 70
+```
+
+Behavior:
+
+- `0` disables gating
+- transcripts with QC score below the threshold are skipped before any API call
+- skip decisions are recorded in `[ANALYZED].meta.json` with status `qc_blocked`
+- if the transcript file changes later, it is automatically reconsidered on the next run
+
+You can also set a default via env:
+
+```text
+QC_THRESHOLD=70
+```
 
 ---
 

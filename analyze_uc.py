@@ -24,30 +24,42 @@ Usage:
 
 import argparse
 import csv
+import hashlib
+import json
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TextIO
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv(Path.home() / ".config" / "client-transcript-analyzer" / ".env")
+_HERE = Path(__file__).parent
+_PROJECT_ENV = _HERE / ".env"
+_LEGACY_ENV = Path.home() / ".config" / "client-transcript-analyzer" / ".env"
+
+load_dotenv(_PROJECT_ENV)
+if not _PROJECT_ENV.exists():
+    load_dotenv(_LEGACY_ENV)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-TRANSCRIPTS_PATH = Path(os.environ["TRANSCRIPTS_PATH"])
+TRANSCRIPTS_PATH_RAW = os.environ.get("TRANSCRIPTS_PATH", "").strip()
+TRANSCRIPTS_PATH = Path(TRANSCRIPTS_PATH_RAW) if TRANSCRIPTS_PATH_RAW else Path()
 OUTPUT_PATH = Path(os.environ.get("OUTPUT_PATH", Path(__file__).parent / "output"))
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 CONTEXT_DIR = Path(__file__).parent / "client_context"
 
 MODEL_TRANSCRIPT = os.environ.get("MODEL_TRANSCRIPT", "claude-3-5-haiku-20241022")
 MODEL_SUMMARY = os.environ.get("MODEL_SUMMARY", "claude-3-5-sonnet-20241022")
 RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP", "2"))
+QC_THRESHOLD_DEFAULT = int(os.environ.get("QC_THRESHOLD", "0"))
 
 # Backlog CSVs — paths relative to this script
 _HERE = Path(__file__).parent
@@ -60,6 +72,10 @@ UC_NAMES = {
     "UC1": "SOLSYS End-to-End Quote (Use Case 1)",
     "UC2": "SNGX Technician Quote (Use Case 2)",
 }
+
+
+def required_csv_paths() -> list[Path]:
+    return [CSV_UC0, CSV_UC1, CSV_UC2]
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -107,6 +123,8 @@ _client: OpenAI | None = None
 def _api() -> OpenAI:
     global _client
     if _client is None:
+        if not GITHUB_TOKEN:
+            raise RuntimeError("GITHUB_TOKEN is missing. Set it in ~/.config/client-transcript-analyzer/.env")
         _client = OpenAI(
             base_url="https://models.inference.ai.azure.com",
             api_key=GITHUB_TOKEN,
@@ -146,6 +164,11 @@ def load_base_context() -> str:
     if rolodex:
         parts.append("## People Reference\n" + rolodex)
     return "\n\n---\n\n".join(parts)
+
+
+def load_solution_prompt() -> str:
+    """Load optional transcript extraction guidance used by the BU pipeline."""
+    return _load_file("solution_prompt.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +351,10 @@ def analyzed_path(transcript: Path, feature_key: str) -> Path:
     return _FEATURES_OUT / feature_key / f"{transcript.stem} [ANALYZED].txt"
 
 
+def analyzed_meta_path(transcript: Path, feature_key: str) -> Path:
+    return _FEATURES_OUT / feature_key / f"{transcript.stem} [ANALYZED].meta.json"
+
+
 def feature_summary_path(feature_key: str, display_name: str) -> Path:
     safe = re.sub(r'[<>:"/\\|?*]', "-", display_name)
     return _FEATURES_OUT / feature_key / f"[FEATURE SUMMARY] {safe}.md"
@@ -341,11 +368,284 @@ def gap_report_path() -> Path:
     return OUTPUT_PATH / "[GAP REPORT] coverage.md"
 
 
+def qc_report_path() -> Path:
+    return OUTPUT_PATH / "[QC REPORT] transcript_quality.md"
+
+
+def logs_dir() -> Path:
+    return OUTPUT_PATH / "logs"
+
+
+def run_log_path(timestamp: str) -> Path:
+    return logs_dir() / f"run_{timestamp}.log"
+
+
+def error_log_path(timestamp: str) -> Path:
+    return logs_dir() / f"errors_{timestamp}.log"
+
+
+class TeeStream:
+    def __init__(self, *streams: TextIO):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_run_logging() -> tuple[Path, Path]:
+    logs_dir().mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    run_path = run_log_path(timestamp)
+    err_path = error_log_path(timestamp)
+
+    run_handle = open(run_path, "a", encoding="utf-8")
+    err_handle = open(err_path, "a", encoding="utf-8")
+
+    sys.stdout = TeeStream(sys.__stdout__, run_handle)
+    sys.stderr = TeeStream(sys.__stderr__, run_handle, err_handle)
+
+    print(f"[log] full run log -> {run_path}")
+    print(f"[log] error log -> {err_path}")
+    return run_path, err_path
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _source_signature(transcript: Path) -> dict[str, object]:
+    raw = transcript.read_bytes()
+    stat = transcript.stat()
+    return {
+        "source_path": str(transcript.resolve()),
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "source_sha256": _sha256_bytes(raw),
+    }
+
+
+def _context_signature(base_context: str, solution_prompt: str) -> str:
+    return _sha256_bytes((base_context + "\n\n---\n\n" + solution_prompt).encode("utf-8"))
+
+
+def _read_meta(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _is_analysis_fresh(meta: dict[str, object], source_sig: dict[str, object], context_sig: str) -> bool:
+    required = {
+        "status": "ok",
+        "source_sha256": source_sig["source_sha256"],
+        "source_size": source_sig["source_size"],
+        "source_mtime_ns": source_sig["source_mtime_ns"],
+        "model_transcript": MODEL_TRANSCRIPT,
+        "context_signature": context_sig,
+    }
+    return all(meta.get(k) == v for k, v in required.items())
+
+
+def _is_qc_block_fresh(
+    meta: dict[str, object],
+    source_sig: dict[str, object],
+    context_sig: str,
+    qc_threshold: int,
+) -> bool:
+    required = {
+        "status": "qc_blocked",
+        "source_sha256": source_sig["source_sha256"],
+        "source_size": source_sig["source_size"],
+        "source_mtime_ns": source_sig["source_mtime_ns"],
+        "model_transcript": MODEL_TRANSCRIPT,
+        "context_signature": context_sig,
+        "qc_threshold": qc_threshold,
+    }
+    return all(meta.get(k) == v for k, v in required.items())
+
+
+def _write_meta(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _iter_pipeline_transcripts(registry: dict[str, Feature], unmatched_folders: list[Path]) -> list[tuple[Path, str]]:
+    """Collect transcripts exactly as this pipeline discovers them."""
+    items: list[tuple[Path, str]] = []
+
+    for feat in registry.values():
+        if feat.folder is None:
+            continue
+        key = feat.prefix or re.sub(r"[^a-z0-9]+", "-", feat.arm_name.lower())
+        for p in find_transcripts(feat.folder):
+            items.append((p, key))
+
+    for folder in unmatched_folders:
+        key = re.sub(r"[^a-z0-9]+", "-", folder.name.lower()).strip("-") or "unmatched"
+        for p in find_transcripts(folder):
+            items.append((p, key))
+
+    for p in sorted(TRANSCRIPTS_PATH.iterdir()):
+        if p.is_file() and p.suffix.lower() in (".vtt", ".txt"):
+            items.append((p, "ROOT"))
+
+    return items
+
+
+def _quality_metrics(text: str) -> dict[str, float | int]:
+    words = re.findall(r"\b\w+\b", text)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    line_count = len(lines)
+    unique_line_count = len(set(lines)) if line_count else 0
+    duplicate_ratio = 0.0 if line_count == 0 else 1.0 - (unique_line_count / line_count)
+    inaudible_hits = len(re.findall(r"\b(inaudible|unintelligible|unclear)\b|\[[^\]]*(inaudible|unintelligible|unclear)[^\]]*\]", text, flags=re.IGNORECASE))
+
+    return {
+        "chars": len(text),
+        "words": len(words),
+        "lines": line_count,
+        "duplicate_ratio": duplicate_ratio,
+        "inaudible_hits": inaudible_hits,
+    }
+
+
+def _quality_assessment(metrics: dict[str, float | int]) -> tuple[int, str, list[str]]:
+    score = 100
+    flags: list[str] = []
+
+    chars = int(metrics["chars"])
+    words = int(metrics["words"])
+    lines = int(metrics["lines"])
+    duplicate_ratio = float(metrics["duplicate_ratio"])
+    inaudible_hits = int(metrics["inaudible_hits"])
+
+    if chars < 400:
+        score -= 40
+        flags.append("very short parsed text")
+    elif chars < 1000:
+        score -= 20
+        flags.append("short parsed text")
+
+    if words < 80:
+        score -= 25
+        flags.append("low word count")
+
+    if lines < 10:
+        score -= 20
+        flags.append("few speaker/text lines")
+
+    if duplicate_ratio > 0.5:
+        score -= 35
+        flags.append("high repeated content")
+    elif duplicate_ratio > 0.3:
+        score -= 20
+        flags.append("moderate repeated content")
+
+    if inaudible_hits >= 10:
+        score -= 25
+        flags.append("many inaudible/unclear markers")
+    elif inaudible_hits >= 3:
+        score -= 10
+        flags.append("some inaudible/unclear markers")
+
+    score = max(0, min(100, score))
+    if score >= 75:
+        label = "good"
+    elif score >= 50:
+        label = "watch"
+    else:
+        label = "poor"
+
+    return score, label, flags
+
+
+def generate_qc_report(registry: dict[str, Feature], unmatched_folders: list[Path]) -> None:
+    out = qc_report_path()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, object]] = []
+    for transcript, bucket in _iter_pipeline_transcripts(registry, unmatched_folders):
+        try:
+            text = transcript_to_text(transcript)
+            metrics = _quality_metrics(text)
+            score, label, flags = _quality_assessment(metrics)
+            rows.append({
+                "path": str(transcript),
+                "bucket": bucket,
+                "score": score,
+                "label": label,
+                "chars": metrics["chars"],
+                "words": metrics["words"],
+                "lines": metrics["lines"],
+                "duplicate_ratio": metrics["duplicate_ratio"],
+                "inaudible_hits": metrics["inaudible_hits"],
+                "flags": flags,
+            })
+        except Exception as e:
+            rows.append({
+                "path": str(transcript),
+                "bucket": bucket,
+                "score": 0,
+                "label": "error",
+                "chars": 0,
+                "words": 0,
+                "lines": 0,
+                "duplicate_ratio": 1.0,
+                "inaudible_hits": 0,
+                "flags": [f"parse error: {e}"],
+            })
+
+    rows.sort(key=lambda r: (int(r["score"]), str(r["path"])))
+    total = len(rows)
+    poor = sum(1 for r in rows if r["label"] in ("poor", "error"))
+    watch = sum(1 for r in rows if r["label"] == "watch")
+    good = sum(1 for r in rows if r["label"] == "good")
+
+    lines: list[str] = []
+    lines.append("# Transcript Quality Report\n")
+    lines.append("Heuristic QC to detect likely transcription quality problems before model analysis.\n")
+    lines.append(f"Generated: {datetime.now(UTC).isoformat()}  ")
+    lines.append(f"Total transcripts scanned: **{total}**  ")
+    lines.append(f"Good: **{good}** | Watch: **{watch}** | Poor/Error: **{poor}**\n")
+
+    lines.append("## Highest-Risk Transcripts\n")
+    risky = [r for r in rows if r["label"] in ("poor", "error")][:25]
+    if risky:
+        for r in risky:
+            flags = "; ".join(r["flags"]) if r["flags"] else "none"
+            lines.append(f"- **[{r['score']}/100 {r['label']}]** {r['path']} ({r['bucket']})")
+            lines.append(f"  - flags: {flags}")
+    else:
+        lines.append("- No high-risk transcripts detected by heuristics.")
+
+    lines.append("\n## Full QC Table\n")
+    lines.append("| Score | Label | Bucket | Chars | Words | Lines | Dup Ratio | Inaudible | File |")
+    lines.append("|------:|-------|--------|------:|------:|------:|----------:|----------:|------|")
+    for r in rows:
+        lines.append(
+            "| "
+            f"{r['score']} | {r['label']} | {r['bucket']} | {r['chars']} | {r['words']} | {r['lines']} | "
+            f"{float(r['duplicate_ratio']):.2f} | {r['inaudible_hits']} | {r['path']} |"
+        )
+
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  [qc report] written -> {out}")
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
-def build_transcript_system_prompt(feat: Feature, base_context: str) -> str:
+def build_transcript_system_prompt(feat: Feature, base_context: str, solution_prompt: str) -> str:
     uc_scope_parts = []
     for uc in ("UC0", "UC1", "UC2"):
         if feat.in_scope(uc):
@@ -377,6 +677,8 @@ If this transcript has no meaningful discussion of **{feat.display_name}**, say 
     parts = []
     if base_context:
         parts.append(base_context)
+    if solution_prompt:
+        parts.append("## Global Transcript Extraction Guidance\n" + solution_prompt)
     parts.append(feature_block)
     return "\n\n---\n\n".join(parts)
 
@@ -433,21 +735,70 @@ Synthesize across all features for this use case:
 # Core processing
 # ---------------------------------------------------------------------------
 
-def analyze_transcript(transcript: Path, feat: Feature, base_context: str) -> str | None:
+def analyze_transcript(
+    transcript: Path,
+    feat: Feature,
+    base_context: str,
+    solution_prompt: str,
+    qc_threshold: int = 0,
+) -> str | None:
     feature_key = feat.prefix or re.sub(r"[^a-z0-9]+", "-", feat.arm_name.lower())
     out = analyzed_path(transcript, feature_key)
+    meta_out = analyzed_meta_path(transcript, feature_key)
+    source_sig = _source_signature(transcript)
+    context_sig = _context_signature(base_context, solution_prompt)
+    meta = _read_meta(meta_out)
+
     if out.exists():
-        print(f"    [skip] {transcript.name} — already analyzed")
-        return out.read_text(encoding="utf-8")
+        if meta and _is_analysis_fresh(meta, source_sig, context_sig):
+            print(f"    [skip] {transcript.name} — already analyzed (fresh cache)")
+            return out.read_text(encoding="utf-8")
+        print(f"    [reprocess] {transcript.name} — source/prompt/model changed or legacy cache")
+    elif meta and qc_threshold > 0 and _is_qc_block_fresh(meta, source_sig, context_sig, qc_threshold):
+        print(f"    [skip] {transcript.name} — blocked by QC threshold ({qc_threshold})")
+        return None
 
     print(f"    [analyze] {transcript.name} ...", end=" ", flush=True)
     try:
         text = transcript_to_text(transcript)
-        if len(text) < 100:
-            print("SKIP (too short)")
+        metrics = _quality_metrics(text)
+        qc_score, qc_label, qc_flags = _quality_assessment(metrics)
+
+        if qc_threshold > 0 and qc_score < qc_threshold:
+            print(f"SKIP (qc {qc_score} < {qc_threshold})")
+            _write_meta(meta_out, {
+                **source_sig,
+                "status": "qc_blocked",
+                "reason": "transcript quality below threshold",
+                "qc_threshold": qc_threshold,
+                "qc_score": qc_score,
+                "qc_label": qc_label,
+                "qc_flags": qc_flags,
+                "text_chars": len(text),
+                "model_transcript": MODEL_TRANSCRIPT,
+                "context_signature": context_sig,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+            })
             return None
 
-        system = build_transcript_system_prompt(feat, base_context)
+        if len(text) < 100:
+            print("SKIP (too short)")
+            _write_meta(meta_out, {
+                **source_sig,
+                "status": "too_short",
+                "reason": "parsed transcript shorter than 100 characters",
+                "qc_threshold": qc_threshold,
+                "qc_score": qc_score,
+                "qc_label": qc_label,
+                "qc_flags": qc_flags,
+                "text_chars": len(text),
+                "model_transcript": MODEL_TRANSCRIPT,
+                "context_signature": context_sig,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+            })
+            return None
+
+        system = build_transcript_system_prompt(feat, base_context, solution_prompt)
         result = call_model(
             system=system,
             user=f"Transcript: {transcript.name}\n\n{text}",
@@ -455,11 +806,33 @@ def analyze_transcript(transcript: Path, feat: Feature, base_context: str) -> st
         )
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(result, encoding="utf-8")
+        _write_meta(meta_out, {
+            **source_sig,
+            "status": "ok",
+            "qc_threshold": qc_threshold,
+            "qc_score": qc_score,
+            "qc_label": qc_label,
+            "qc_flags": qc_flags,
+            "text_chars": len(text),
+            "result_chars": len(result),
+            "model_transcript": MODEL_TRANSCRIPT,
+            "context_signature": context_sig,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+        })
         print("done")
         time.sleep(RATE_LIMIT_SLEEP)
         return result
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"ERROR: {e}", file=sys.stderr)
+        _write_meta(meta_out, {
+            **source_sig,
+            "status": "error",
+            "error": str(e),
+            "qc_threshold": qc_threshold,
+            "model_transcript": MODEL_TRANSCRIPT,
+            "context_signature": context_sig,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+        })
         return None
 
 
@@ -480,7 +853,7 @@ def summarize_feature(feat: Feature, analyses: list[str], base_context: str) -> 
         time.sleep(RATE_LIMIT_SLEEP)
         return result
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"ERROR: {e}", file=sys.stderr)
         return None
 
 
@@ -503,7 +876,7 @@ def summarize_uc(uc: str, feature_summaries: list[tuple[str, str]], base_context
         print("done")
         time.sleep(RATE_LIMIT_SLEEP)
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"ERROR: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +979,13 @@ def find_transcripts(folder: Path) -> list[Path]:
     )
 
 
-def process_feature(feat: Feature, base_context: str, summary_only: bool = False) -> str | None:
+def process_feature(
+    feat: Feature,
+    base_context: str,
+    solution_prompt: str,
+    summary_only: bool = False,
+    qc_threshold: int = 0,
+) -> str | None:
     folder_name = feat.folder.name if feat.folder else "(no folder)"
     transcripts = find_transcripts(feat.folder) if feat.folder else []
     print(f"\n  Feature: {feat.display_name} [{folder_name}] — {len(transcripts)} transcripts")
@@ -628,7 +1007,7 @@ def process_feature(feat: Feature, base_context: str, summary_only: bool = False
             print(f"    [skip] no transcripts")
             return None
         for t in transcripts:
-            result = analyze_transcript(t, feat, base_context)
+            result = analyze_transcript(t, feat, base_context, solution_prompt, qc_threshold=qc_threshold)
             if result:
                 analyses.append(result)
 
@@ -638,6 +1017,97 @@ def process_feature(feat: Feature, base_context: str, summary_only: bool = False
     return summarize_feature(feat, analyses, base_context)
 
 
+def process_unmatched_folder(
+    folder: Path,
+    base_context: str,
+    solution_prompt: str,
+    summary_only: bool = False,
+    qc_threshold: int = 0,
+) -> str | None:
+    """Analyze folders not mapped to backlog features using generic context."""
+    synthetic_feature = Feature(
+        prefix="",
+        arm_name=folder.name,
+        siemens_name=folder.name,
+        definition=(
+            "No backlog feature mapping found for this folder. "
+            "Extract the strongest requirements, decisions, and open items that appear in this transcript."
+        ),
+        uc0_scope="",
+        uc1_scope="",
+        uc2_scope="",
+        sf_owner="",
+        folder=folder,
+    )
+    print(f"\n  Unmatched folder: {folder.name}")
+    return process_feature(
+        synthetic_feature,
+        base_context,
+        solution_prompt,
+        summary_only=summary_only,
+        qc_threshold=qc_threshold,
+    )
+
+
+def process_root_transcripts(
+    base_context: str,
+    solution_prompt: str,
+    summary_only: bool = False,
+    qc_threshold: int = 0,
+) -> str | None:
+    """Analyze transcript files that exist directly under TRANSCRIPTS_PATH."""
+    synthetic_feature = Feature(
+        prefix="",
+        arm_name="ROOT",
+        siemens_name="ROOT",
+        definition=(
+            "Transcript found directly in TRANSCRIPTS_PATH without a feature folder. "
+            "Extract the strongest requirements, decisions, and open items."
+        ),
+        uc0_scope="",
+        uc1_scope="",
+        uc2_scope="",
+        sf_owner="",
+        folder=TRANSCRIPTS_PATH,
+    )
+
+    root_transcripts = [
+        p for p in sorted(TRANSCRIPTS_PATH.iterdir())
+        if p.is_file() and p.suffix.lower() in (".vtt", ".txt")
+    ]
+
+    if not root_transcripts:
+        return None
+
+    print(f"\n=== Processing root-level transcripts ({len(root_transcripts)}) ===")
+
+    if summary_only:
+        return process_feature(
+            synthetic_feature,
+            base_context,
+            solution_prompt,
+            summary_only=True,
+            qc_threshold=qc_threshold,
+        )
+
+    analyses: list[str] = []
+    for t in root_transcripts:
+        result = analyze_transcript(
+            t,
+            synthetic_feature,
+            base_context,
+            solution_prompt,
+            qc_threshold=qc_threshold,
+        )
+        if result:
+            analyses.append(result)
+
+    if not analyses:
+        return None
+
+    return summarize_feature(synthetic_feature, analyses, base_context)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Use-case focused transcript analysis")
     parser.add_argument("--feature", help="Process only this feature (numeric prefix, e.g. '1.04')")
@@ -645,7 +1115,19 @@ def main() -> None:
                         help="Skip transcript analysis; re-run summaries from existing [ANALYZED] files")
     parser.add_argument("--gap-only", action="store_true",
                         help="Only regenerate the gap report (no API calls)")
+    parser.add_argument("--qc-only", action="store_true",
+                        help="Only generate transcript quality report (no API calls)")
+    parser.add_argument("--qc-threshold", type=int, default=QC_THRESHOLD_DEFAULT,
+                        help="Minimum QC score required before transcript analysis runs; 0 disables gating")
     args = parser.parse_args()
+
+    if args.qc_threshold < 0 or args.qc_threshold > 100:
+        sys.exit("--qc-threshold must be between 0 and 100")
+
+    setup_run_logging()
+
+    if not TRANSCRIPTS_PATH_RAW:
+        sys.exit("TRANSCRIPTS_PATH is missing. Set it in ~/.config/client-transcript-analyzer/.env")
 
     if not TRANSCRIPTS_PATH.exists():
         sys.exit(f"TRANSCRIPTS_PATH not found: {TRANSCRIPTS_PATH}")
@@ -653,28 +1135,55 @@ def main() -> None:
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
     _FEATURES_OUT.mkdir(parents=True, exist_ok=True)
 
-    print("Loading feature registry from backlog CSVs...")
-    registry = load_feature_registry()
-    print(f"  {len(registry)} features loaded")
+    missing_csvs = [p for p in required_csv_paths() if not p.exists()]
 
-    print("Matching transcript folders...")
-    unmatched = match_folders_to_features(registry)
-    matched = sum(1 for f in registry.values() if f.folder is not None)
-    print(f"  {matched} folders matched, {len(unmatched)} unmatched")
-    if unmatched:
-        print(f"  Unmatched: {[p.name for p in unmatched]}")
+    if missing_csvs and not args.qc_only:
+        missing = "\n".join(f"- {p}" for p in missing_csvs)
+        sys.exit(
+            "Required backlog CSV files are missing.\n"
+            "Place them under client_data/ or run with --qc-only.\n"
+            f"Missing files:\n{missing}"
+        )
+
+    if missing_csvs and args.qc_only:
+        print("[warn] Backlog CSV files missing; QC will run folder-only discovery.")
+        registry = {}
+        unmatched = [p for p in sorted(TRANSCRIPTS_PATH.iterdir()) if p.is_dir()]
+        matched = 0
+    else:
+        print("Loading feature registry from backlog CSVs...")
+        registry = load_feature_registry()
+        print(f"  {len(registry)} features loaded")
+
+        print("Matching transcript folders...")
+        unmatched = match_folders_to_features(registry)
+        matched = sum(1 for f in registry.values() if f.folder is not None)
+        print(f"  {matched} folders matched, {len(unmatched)} unmatched")
+        if unmatched:
+            print(f"  Unmatched: {[p.name for p in unmatched]}")
 
     if args.gap_only:
         generate_gap_report(registry, unmatched)
         return
 
+    if args.qc_only:
+        generate_qc_report(registry, unmatched)
+        return
+
     base_context = load_base_context()
+    solution_prompt = load_solution_prompt()
 
     if args.feature:
         feat = registry.get(args.feature)
         if not feat:
             sys.exit(f"Feature '{args.feature}' not found. Available prefixes: {sorted(registry)}")
-        process_feature(feat, base_context, summary_only=args.summary_only)
+        process_feature(
+            feat,
+            base_context,
+            solution_prompt,
+            summary_only=args.summary_only,
+            qc_threshold=args.qc_threshold,
+        )
         generate_gap_report(registry, unmatched)
         return
 
@@ -685,11 +1194,35 @@ def main() -> None:
     for key, feat in sorted(registry.items(), key=lambda kv: (kv[1].prefix or "z", kv[1].arm_name)):
         if feat.folder is None:
             continue
-        summary = process_feature(feat, base_context, summary_only=args.summary_only)
+        summary = process_feature(
+            feat,
+            base_context,
+            solution_prompt,
+            summary_only=args.summary_only,
+            qc_threshold=args.qc_threshold,
+        )
         if summary:
             for uc in UC_NAMES:
                 if feat.in_scope(uc):
                     feature_summaries_by_uc[uc].append((feat.display_name, summary))
+
+    if unmatched:
+        print(f"\n=== Processing {len(unmatched)} unmatched folders ===")
+        for folder in unmatched:
+            process_unmatched_folder(
+                folder,
+                base_context,
+                solution_prompt,
+                summary_only=args.summary_only,
+                qc_threshold=args.qc_threshold,
+            )
+
+    process_root_transcripts(
+        base_context,
+        solution_prompt,
+        summary_only=args.summary_only,
+        qc_threshold=args.qc_threshold,
+    )
 
     print("\n=== Generating UC summaries ===")
     for uc, summaries in feature_summaries_by_uc.items():

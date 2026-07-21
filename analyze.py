@@ -21,7 +21,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv(Path.home() / ".config" / "client-transcript-analyzer" / ".env")
+_HERE = Path(__file__).parent
+_PROJECT_ENV = _HERE / ".env"
+_LEGACY_ENV = Path.home() / ".config" / "client-transcript-analyzer" / ".env"
+
+load_dotenv(_PROJECT_ENV)
+if not _PROJECT_ENV.exists():
+    load_dotenv(_LEGACY_ENV)
 
 # ---------------------------------------------------------------------------
 # Config
