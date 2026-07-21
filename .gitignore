@@ -1,5 +1,7 @@
 client_context/*
 !client_context/README.txt
+client_data/
+HANDOVER.md
 output/
 .env
 *.pyc
