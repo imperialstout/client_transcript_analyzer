@@ -59,6 +59,48 @@ QC_THRESHOLD_DEFAULT = int(os.environ.get("QC_THRESHOLD", "0"))
 COPILOT_TIMEOUT_SECONDS = int(os.environ.get("COPILOT_TIMEOUT_SECONDS", "900"))
 
 # ---------------------------------------------------------------------------
+# Long-path-safe file I/O
+#
+# BU folder names + analysis filenames (which embed the source transcript
+# name plus " [ANALYZED].txt"/".meta.json") can push the full path past
+# Windows' legacy 260-character MAX_PATH limit, especially under deeply
+# nested OneDrive paths. That previously caused a write to fail; if it then
+# ALSO failed while trying to record the error (same long-path problem),
+# the exception went unhandled and crashed the entire batch run instead of
+# just that one transcript. These helpers use the \\?\ extended-length
+# path prefix (Windows-only; no-op elsewhere) so long paths write/read
+# successfully instead of raising FileNotFoundError.
+# ---------------------------------------------------------------------------
+
+def _long_path(path: Path) -> str:
+    if os.name != "nt":
+        return str(path)
+    resolved = str(path.resolve())
+    if resolved.startswith("\\\\?\\"):
+        return resolved
+    if resolved.startswith("\\\\"):  # UNC path
+        return "\\\\?\\UNC\\" + resolved.lstrip("\\")
+    return "\\\\?\\" + resolved
+
+
+def _safe_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    os.makedirs(_long_path(path.parent), exist_ok=True)
+    with open(_long_path(path), "w", encoding=encoding) as f:
+        f.write(content)
+
+
+def _safe_read_text(path: Path, encoding: str = "utf-8", errors: str = "strict") -> str:
+    with open(_long_path(path), "r", encoding=encoding, errors=errors) as f:
+        return f.read()
+
+
+def _safe_append_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    os.makedirs(_long_path(path.parent), exist_ok=True)
+    with open(_long_path(path), "a", encoding=encoding) as f:
+        f.write(content)
+
+
+# ---------------------------------------------------------------------------
 # Copilot CLI client
 # ---------------------------------------------------------------------------
 
@@ -398,7 +440,7 @@ _SPEAKER_LINE = re.compile(r"^([^:]{2,60}):\s+(.+)$")
 
 
 def vtt_to_text(vtt_path: Path) -> str:
-    lines = vtt_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = _safe_read_text(vtt_path, encoding="utf-8", errors="replace").splitlines()
     segments: list[tuple[str, str]] = []  # (speaker, text)
 
     current_speaker = ""
@@ -448,7 +490,7 @@ def vtt_to_text(vtt_path: Path) -> str:
 def transcript_to_text(path: Path) -> str:
     if path.suffix.lower() == ".vtt":
         return vtt_to_text(path)
-    return path.read_text(encoding="utf-8", errors="replace").strip()
+    return _safe_read_text(path, encoding="utf-8", errors="replace").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -496,11 +538,12 @@ def needs_followup_path() -> Path:
 def log_needs_followup(bu: str, vtt_name: str, reason: str) -> None:
     """Append a one-line record of a failed/timed-out transcript so problem
     files are easy to spot and revisit later, without blocking the batch."""
-    path = needs_followup_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).isoformat()
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{timestamp} | {bu} | {vtt_name} | {reason}\n")
+    try:
+        _safe_append_text(needs_followup_path(), f"{timestamp} | {bu} | {vtt_name} | {reason}\n")
+    except Exception as e:
+        # Never let follow-up bookkeeping itself crash the batch.
+        print(f"  [warn] could not write NEEDS_FOLLOWUP entry: {e}", file=sys.stderr)
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -526,14 +569,13 @@ def _read_meta(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(_safe_read_text(path, encoding="utf-8"))
     except Exception:
         return None
 
 
 def _write_meta(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    _safe_write_text(path, json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
 
 def _is_analysis_fresh(meta: dict[str, object], source_sig: dict[str, object], system_sig: str) -> bool:
@@ -710,6 +752,31 @@ def generate_qc_report(bus: dict[str, list[Path]]) -> None:
 # Core processing
 # ---------------------------------------------------------------------------
 
+def _try_record_failure(
+    meta_out: Path,
+    source_sig: dict[str, object],
+    system_sig: str,
+    qc_threshold: int,
+    status: str,
+    error: str,
+) -> None:
+    """Best-effort meta write for a failed/timed-out transcript. Never
+    raises: a secondary I/O failure while handling the first one should
+    not crash the whole batch run."""
+    try:
+        _write_meta(meta_out, {
+            **source_sig,
+            "status": status,
+            "error": error,
+            "qc_threshold": qc_threshold,
+            "model_transcript": MODEL_TRANSCRIPT,
+            "system_signature": system_sig,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+        })
+    except Exception as e:
+        print(f"  [warn] could not write failure meta for {meta_out.name}: {e}", file=sys.stderr)
+
+
 def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -> str | None:
     out = analyzed_path(vtt, bu)
     meta_out = analyzed_meta_path(vtt, bu)
@@ -719,7 +786,7 @@ def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -
     if out.exists():
         if meta and _is_analysis_fresh(meta, source_sig, system_sig):
             print(f"  [skip] {vtt.name} — already analyzed (fresh cache)")
-            return out.read_text(encoding="utf-8")
+            return _safe_read_text(out, encoding="utf-8")
         print(f"  [reprocess] {vtt.name} — source/prompt/model changed or legacy cache")
     elif meta and qc_threshold > 0 and _is_qc_block_fresh(meta, source_sig, system_sig, qc_threshold):
         print(f"  [skip] {vtt.name} — blocked by QC threshold ({qc_threshold})")
@@ -774,8 +841,7 @@ def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -
             source_text=text,
             model=MODEL_TRANSCRIPT,
         )
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(result, encoding="utf-8")
+        _safe_write_text(out, result, encoding="utf-8")
         _write_meta(meta_out, {
             **source_sig,
             "status": "ok",
@@ -794,28 +860,12 @@ def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -
         return result
     except TimeoutError as e:
         print(f"TIMEOUT: {e}", file=sys.stderr)
-        _write_meta(meta_out, {
-            **source_sig,
-            "status": "timeout",
-            "error": str(e),
-            "qc_threshold": qc_threshold,
-            "model_transcript": MODEL_TRANSCRIPT,
-            "system_signature": system_sig,
-            "updated_at_utc": datetime.now(UTC).isoformat(),
-        })
+        _try_record_failure(meta_out, source_sig, system_sig, qc_threshold, "timeout", str(e))
         log_needs_followup(bu, vtt.name, f"TIMEOUT: {e}")
         return None
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        _write_meta(meta_out, {
-            **source_sig,
-            "status": "error",
-            "error": str(e),
-            "qc_threshold": qc_threshold,
-            "model_transcript": MODEL_TRANSCRIPT,
-            "system_signature": system_sig,
-            "updated_at_utc": datetime.now(UTC).isoformat(),
-        })
+        _try_record_failure(meta_out, source_sig, system_sig, qc_threshold, "error", str(e))
         log_needs_followup(bu, vtt.name, f"ERROR: {e}")
         return None
 
@@ -846,12 +896,12 @@ def summarize_bu(bu: str, analyses: list[str], system: str) -> None:
             source_text=bundle,
             model=MODEL_SUMMARY,
         )
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(result, encoding="utf-8")
+        _safe_write_text(out, result, encoding="utf-8")
         print("done")
         time.sleep(RATE_LIMIT_SLEEP)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
+        log_needs_followup(bu, "[BU SUMMARY]", f"ERROR: {e}")
 
 
 def process_bu(
@@ -870,12 +920,21 @@ def process_bu(
         for vtt in vtts:
             out = analyzed_path(vtt, bu)
             if out.exists():
-                analyses.append(out.read_text(encoding="utf-8"))
+                analyses.append(_safe_read_text(out, encoding="utf-8"))
             else:
                 print(f"  [warn] no analysis found for {vtt.name} — skipping from summary")
     else:
         for vtt in vtts:
-            result = analyze_transcript(vtt, bu, system, qc_threshold=qc_threshold)
+            # Defense-in-depth: analyze_transcript already catches its own
+            # errors/timeouts, but a genuinely unexpected exception here
+            # should never be allowed to kill the whole batch run. Log it
+            # and keep processing the remaining transcripts/BUs.
+            try:
+                result = analyze_transcript(vtt, bu, system, qc_threshold=qc_threshold)
+            except Exception as e:
+                print(f"  [ERROR] unexpected failure analyzing {vtt.name}: {e}", file=sys.stderr)
+                log_needs_followup(bu, vtt.name, f"UNEXPECTED ERROR: {e}")
+                result = None
             if result:
                 analyses.append(result)
 
@@ -945,14 +1004,20 @@ def main() -> None:
         )
     else:
         for bu_name in sorted(bus):
-            process_bu(
-                bu_name,
-                bus[bu_name],
-                system,
-                summary_only=args.summary_only,
-                transcript_only=args.transcript_only,
-                qc_threshold=args.qc_threshold,
-            )
+            try:
+                process_bu(
+                    bu_name,
+                    bus[bu_name],
+                    system,
+                    summary_only=args.summary_only,
+                    transcript_only=args.transcript_only,
+                    qc_threshold=args.qc_threshold,
+                )
+            except Exception as e:
+                # A hard failure in one BU (e.g. an unexpected I/O error)
+                # should not prevent the remaining BUs from being processed.
+                print(f"\n[ERROR] BU '{bu_name}' failed unexpectedly: {e}", file=sys.stderr)
+                log_needs_followup(bu_name, "[BU]", f"UNEXPECTED BU ERROR: {e}")
 
     print("\nAll done.")
 
