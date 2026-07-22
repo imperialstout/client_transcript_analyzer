@@ -10,3 +10,4 @@ _copilot_single_test/
 __pycache__/
 .venv/
 venv/
+full_run_std*.log

@@ -44,6 +44,42 @@ MODEL_CHANGELOG = os.environ.get("COPILOT_MODEL_SUMMARY", "auto")
 
 
 # ---------------------------------------------------------------------------
+# Long-path-safe file I/O (mirrors analyze_copilot.py)
+#
+# BU folder names + analysis filenames can push the full path past Windows'
+# legacy 260-char MAX_PATH limit, especially under deeply nested OneDrive
+# paths. Use the \\?\ extended-length prefix so reads/writes here can't
+# raise FileNotFoundError and crash this script mid-run.
+# ---------------------------------------------------------------------------
+
+def _long_path(path: Path) -> str:
+    if os.name != "nt":
+        return str(path)
+    resolved = str(path.resolve())
+    if resolved.startswith("\\\\?\\"):
+        return resolved
+    if resolved.startswith("\\\\"):  # UNC path
+        return "\\\\?\\UNC\\" + resolved.lstrip("\\")
+    return "\\\\?\\" + resolved
+
+
+def _safe_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    os.makedirs(_long_path(path.parent), exist_ok=True)
+    with open(_long_path(path), "w", encoding=encoding) as f:
+        f.write(content)
+
+
+def _safe_read_text(path: Path, encoding: str = "utf-8", errors: str = "strict") -> str:
+    with open(_long_path(path), "r", encoding=encoding, errors=errors) as f:
+        return f.read()
+
+
+def _safe_read_bytes(path: Path) -> bytes:
+    with open(_long_path(path), "rb") as f:
+        return f.read()
+
+
+# ---------------------------------------------------------------------------
 # Rich setup
 # ---------------------------------------------------------------------------
 
@@ -140,7 +176,7 @@ def _run_copilot_changelog(old_text: str, new_text: str, label: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashlib.sha256(_safe_read_bytes(path)).hexdigest()
 
 
 def _discover_transcripts(root: Path) -> list[Path]:
@@ -164,7 +200,7 @@ def _read_meta(path: Path) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(_safe_read_text(path, encoding="utf-8"))
     except Exception:
         return None
 
@@ -175,18 +211,25 @@ def scan_transcripts(root: Path) -> tuple[list[Path], list[Path]]:
     already_done: list[Path] = []
 
     for t in _discover_transcripts(root):
-        bu = _bu_for(t, root)
-        meta = _read_meta(_meta_path(t, bu))
-        if meta and meta.get("status") == "ok":
-            stat = t.stat()
-            if (
-                meta.get("source_sha256") == _sha256_file(t)
-                and meta.get("source_size") == stat.st_size
-                and meta.get("source_mtime_ns") == stat.st_mtime_ns
-            ):
-                already_done.append(t)
-                continue
-        new_or_changed.append(t)
+        try:
+            bu = _bu_for(t, root)
+            meta = _read_meta(_meta_path(t, bu))
+            if meta and meta.get("status") == "ok":
+                stat = t.stat()
+                if (
+                    meta.get("source_sha256") == _sha256_file(t)
+                    and meta.get("source_size") == stat.st_size
+                    and meta.get("source_mtime_ns") == stat.st_mtime_ns
+                ):
+                    already_done.append(t)
+                    continue
+            new_or_changed.append(t)
+        except Exception as e:
+            # A single unreadable/long-path transcript should not abort the
+            # whole scan; treat it as new/changed so analyze_copilot.py
+            # (which has its own long-path-safe I/O) gets a chance at it.
+            _print(f"  [warn] could not check cache status for '{t.name}': {e}")
+            new_or_changed.append(t)
 
     return new_or_changed, already_done
 
@@ -202,7 +245,10 @@ def _collect_summaries(output_root: Path) -> dict[str, str]:
         name = md.name
         if name.startswith("[BU SUMMARY]") or name.startswith("[FEATURE SUMMARY]"):
             label = md.stem.replace("[BU SUMMARY] ", "").replace("[FEATURE SUMMARY] ", "")
-            summaries[label] = md.read_text(encoding="utf-8", errors="replace")
+            try:
+                summaries[label] = _safe_read_text(md, encoding="utf-8", errors="replace")
+            except Exception as e:
+                _print(f"  [warn] could not read summary '{md.name}': {e}")
     return summaries
 
 
@@ -218,7 +264,10 @@ def _read_followup_lines() -> set[str]:
     nf_path = OUTPUT_PATH / "NEEDS_FOLLOWUP.txt"
     if not nf_path.exists():
         return set()
-    return set(nf_path.read_text(encoding="utf-8", errors="replace").strip().splitlines())
+    try:
+        return set(_safe_read_text(nf_path, encoding="utf-8", errors="replace").strip().splitlines())
+    except Exception:
+        return set()
 
 
 def _new_followup_lines(before: set[str]) -> list[str]:
@@ -252,7 +301,10 @@ def _generate_context_review(new_transcripts: list[Path]) -> None:
         bu = _bu_for(t, TRANSCRIPTS_PATH)
         analyzed = OUTPUT_PATH / bu / f"{t.stem} [ANALYZED].txt"
         if analyzed.exists():
-            analyzed_texts.append(f"--- {t.name} ---\n{analyzed.read_text(encoding='utf-8', errors='replace')}")
+            try:
+                analyzed_texts.append(f"--- {t.name} ---\n{_safe_read_text(analyzed, encoding='utf-8', errors='replace')}")
+            except Exception as e:
+                _print(f"  [warn] could not read analysis for '{t.name}': {e}")
 
     if not analyzed_texts:
         return
@@ -292,7 +344,8 @@ def _generate_context_review(new_transcripts: list[Path]) -> None:
 
     run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
     out_path = OUTPUT_PATH / f"[SUGGESTED UPDATES] context_review {run_label}.md"
-    out_path.write_text(
+    _safe_write_text(
+        out_path,
         f"# Suggested Context Updates — {run_label}\n\n"
         "These are items found in recent transcripts that do not appear in your\n"
         "rolodex or program brief. **Review and update those files manually** if relevant.\n"
@@ -367,7 +420,7 @@ def generate_changelog(
     else:
         lines.append("No errors or timeouts.")
 
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _safe_write_text(out_path, "\n".join(lines) + "\n", encoding="utf-8")
     return out_path
 
 
@@ -443,6 +496,10 @@ def main() -> None:
     parser.add_argument("--qc-only", action="store_true", help="Quality check only, no API calls")
     parser.add_argument("--summary-only", action="store_true", help="Re-run summaries from existing analyses")
     parser.add_argument("--no-changelog", action="store_true", help="Skip changelog generation")
+    parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Auto-confirm all prompts (required for non-interactive/background/detached runs)",
+    )
     args = parser.parse_args()
 
     # Setup
@@ -506,7 +563,10 @@ def main() -> None:
 
     if not new_transcripts:
         _print("\nNothing to do — all transcripts are already analyzed.", style="green" if console else "")
-        answer = input("Re-run summaries anyway? (y/N): ").strip().lower()
+        if args.yes:
+            answer = "y"
+        else:
+            answer = input("Re-run summaries anyway? (y/N): ").strip().lower()
         if answer != "y":
             return
         before = _collect_summaries(OUTPUT_PATH)
@@ -518,7 +578,10 @@ def main() -> None:
             generate_changelog(before, after, [], _new_followup_lines(nf_before), run_label)
         return
 
-    answer = input(f"\nAnalyze {len(new_transcripts)} transcript(s) and update summaries? (Y/n): ").strip().lower()
+    if args.yes:
+        answer = "y"
+    else:
+        answer = input(f"\nAnalyze {len(new_transcripts)} transcript(s) and update summaries? (Y/n): ").strip().lower()
     if answer == "n":
         _print("Cancelled.")
         return

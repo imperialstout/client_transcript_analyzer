@@ -12,6 +12,14 @@ That's it. On first launch, `run.py` detects that setup hasn't been done and wal
 
 To redo setup at any time: `python run.py --setup`
 
+For unattended/background use (e.g. large backfills launched as a detached process with no one watching the terminal), add `--yes` to auto-confirm the "analyze N transcripts?" prompts:
+
+```powershell
+python run.py --yes
+```
+
+Note: `--yes` only skips the confirmation prompts in the normal run flow. First-time setup (`--setup` / `setup_wizard.py`) is still interactive by design, since it collects your GitHub PAT and folder paths — run it once manually before automating `run.py`.
+
 ---
 
 ## Scripts overview
