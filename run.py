@@ -211,14 +211,107 @@ def _md5(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# NEEDS_FOLLOWUP.txt helpers (isolate issues from this run only)
+# ---------------------------------------------------------------------------
+
+def _read_followup_lines() -> set[str]:
+    nf_path = OUTPUT_PATH / "NEEDS_FOLLOWUP.txt"
+    if not nf_path.exists():
+        return set()
+    return set(nf_path.read_text(encoding="utf-8", errors="replace").strip().splitlines())
+
+
+def _new_followup_lines(before: set[str]) -> list[str]:
+    return sorted(_read_followup_lines() - before)
+
+
+# ---------------------------------------------------------------------------
+# Context review suggestions
+# ---------------------------------------------------------------------------
+
+def _generate_context_review(new_transcripts: list[Path]) -> None:
+    """
+    After analysis, scan the new [ANALYZED].txt files for names and facts
+    that don't appear in the context files. Write a suggestion file for
+    human review — never modifies context files automatically.
+    """
+    if not new_transcripts:
+        return
+
+    context_dir = _HERE / "client_context"
+    rolodex_path = context_dir / "rolodex.txt"
+    brief_path = context_dir / "program_brief.txt"
+
+    rolodex_text = rolodex_path.read_text(encoding="utf-8", errors="replace") if rolodex_path.exists() else ""
+    brief_text = brief_path.read_text(encoding="utf-8", errors="replace") if brief_path.exists() else ""
+    known_context = (rolodex_text + "\n" + brief_text).lower()
+
+    # Collect the analyzed output for the new transcripts
+    analyzed_texts: list[str] = []
+    for t in new_transcripts:
+        bu = _bu_for(t, TRANSCRIPTS_PATH)
+        analyzed = OUTPUT_PATH / bu / f"{t.stem} [ANALYZED].txt"
+        if analyzed.exists():
+            analyzed_texts.append(f"--- {t.name} ---\n{analyzed.read_text(encoding='utf-8', errors='replace')}")
+
+    if not analyzed_texts:
+        return
+
+    bundle = "\n\n".join(analyzed_texts)
+
+    prompt = (
+        "You are a program context reviewer. Read the analyzed transcript excerpts below.\n\n"
+        "Identify any of the following that appear in the transcripts but are NOT present in the "
+        "known context (rolodex and program brief):\n"
+        "1. Person names — new stakeholders, attendees, or roles mentioned\n"
+        "2. System or product names not in the brief\n"
+        "3. Organizational units or team names not in the brief\n"
+        "4. Key constraints or decisions that seem program-wide and should be in the brief\n\n"
+        "Format your response as a short markdown list under these headings:\n"
+        "## Possible new people\n## Possible new systems/products\n## Possible new org names\n## Possible brief updates\n\n"
+        "If nothing is missing, say so under each heading. Be concise.\n\n"
+        f"KNOWN CONTEXT (rolodex + brief):\n{known_context[:3000]}\n\n"
+        f"ANALYZED TRANSCRIPTS:\n{bundle[:8000]}"
+    )
+
+    _print("  [context review] scanning for missing context ...")
+    exe = _copilot_executable()
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="copilot_ctx_") as tmp_dir:
+        stdout_path = Path(tmp_dir) / "stdout.txt"
+        stderr_path = Path(tmp_dir) / "stderr.txt"
+        cmd = [exe, "-p", prompt, "-s", "--no-custom-instructions", "--no-ask-user"]
+        try:
+            with open(stdout_path, "w", encoding="utf-8") as out_f, \
+                 open(stderr_path, "w", encoding="utf-8") as err_f:
+                subprocess.run(cmd, check=True, stdout=out_f, stderr=err_f,
+                               text=True, timeout=COPILOT_TIMEOUT_SECONDS)
+            suggestion = stdout_path.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception as exc:
+            suggestion = f"[context review failed: {exc}]"
+
+    run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
+    out_path = OUTPUT_PATH / f"[SUGGESTED UPDATES] context_review {run_label}.md"
+    out_path.write_text(
+        f"# Suggested Context Updates — {run_label}\n\n"
+        "These are items found in recent transcripts that do not appear in your\n"
+        "rolodex or program brief. **Review and update those files manually** if relevant.\n"
+        "This file is generated automatically and safe to delete after review.\n\n"
+        + suggestion + "\n",
+        encoding="utf-8",
+    )
+    _print(f"  [context review] suggestions written -> {out_path.name}")
+
+
+# ---------------------------------------------------------------------------
 # Changelog writer
 # ---------------------------------------------------------------------------
 
 def generate_changelog(
     before: dict[str, str],
     after: dict[str, str],
-    processed_count: int,
-    failed_count: int,
+    processed_files: list[Path],
+    this_run_issues: list[str],
     run_label: str,
 ) -> Path:
     changelog_dir = OUTPUT_PATH / "changelog"
@@ -235,8 +328,12 @@ def generate_changelog(
         f"# Changelog — {run_label}",
         "",
         "## What ran",
-        f"- {processed_count} transcript(s) analyzed",
+        f"- {len(processed_files)} transcript(s) analyzed",
     ]
+
+    if processed_files:
+        for f in processed_files:
+            lines.append(f"  - {f.name}")
 
     if changed_labels:
         updated = [l for l in changed_labels if l not in new_labels]
@@ -244,8 +341,6 @@ def generate_changelog(
             lines.append(f"- {len(updated)} summary section(s) updated: {', '.join(updated)}")
     if new_labels:
         lines.append(f"- {len(new_labels)} new section(s) added: {', '.join(new_labels)}")
-    if failed_count:
-        lines.append(f"- {failed_count} transcript(s) failed or timed out (see NEEDS_FOLLOWUP.txt)")
 
     lines += ["", "## What shifted", ""]
 
@@ -264,14 +359,13 @@ def generate_changelog(
                 lines.append(diff_text)
             lines.append("")
 
-    # Needs-followup section
-    nf_path = OUTPUT_PATH / "NEEDS_FOLLOWUP.txt"
-    if nf_path.exists():
-        nf_lines = nf_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
-        if nf_lines:
-            lines += ["", "## Needs follow-up", ""]
-            for entry in nf_lines[-20:]:  # cap at last 20 to avoid huge changelogs
-                lines.append(f"- {entry}")
+    # Issues this run — always present so readers never have to wonder
+    lines += ["## Issues this run", ""]
+    if this_run_issues:
+        for entry in this_run_issues:
+            lines.append(f"- {entry}")
+    else:
+        lines.append("No errors or timeouts.")
 
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_path
@@ -300,6 +394,12 @@ def _print_status_report(
 ) -> None:
     _rule("Run complete")
 
+    # Find most recent context review suggestion file
+    context_review = None
+    review_files = sorted(OUTPUT_PATH.glob("[SUGGESTED UPDATES] context_review *.md"), reverse=True)
+    if review_files:
+        context_review = review_files[0]
+
     if console:
         table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
         table.add_column("Label", style="bold")
@@ -308,7 +408,9 @@ def _print_status_report(
         table.add_row("Transcripts skipped", str(done_count))
         table.add_row("Failed / timed out", str(failed_count) if failed_count else "none")
         if changelog_path:
-            table.add_row("Changelog written", str(changelog_path))
+            table.add_row("Changelog", str(changelog_path))
+        if context_review:
+            table.add_row("Context review", str(context_review))
         if log_path:
             table.add_row("Run log", str(log_path))
         console.print(table)
@@ -317,17 +419,18 @@ def _print_status_report(
         print(f"  Transcripts skipped   : {done_count}")
         print(f"  Failed / timed out    : {failed_count if failed_count else 'none'}")
         if changelog_path:
-            print(f"  Changelog written     : {changelog_path}")
+            print(f"  Changelog             : {changelog_path}")
+        if context_review:
+            print(f"  Context review        : {context_review}")
         if log_path:
             print(f"  Run log               : {log_path}")
 
-    nf_path = OUTPUT_PATH / "NEEDS_FOLLOWUP.txt"
-    if nf_path.exists():
-        nf_lines = nf_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
-        if nf_lines:
-            _print("\n[bold yellow]NEEDS FOLLOW-UP[/bold yellow]" if console else "\nNEEDS FOLLOW-UP:")
-            for line in nf_lines:
-                _print(f"  {line}", style="yellow")
+    if failed_count:
+        _print(
+            "\n[bold yellow]Some transcripts failed or timed out — see 'Issues this run' in the changelog.[/bold yellow]"
+            if console else
+            "\nSome transcripts failed or timed out — see 'Issues this run' in the changelog."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -373,11 +476,14 @@ def main() -> None:
     if args.summary_only:
         _print("Re-running summaries from existing analyses ...")
         before = _collect_summaries(OUTPUT_PATH)
+        nf_before = _read_followup_lines()
         _run_script(["--summary-only"])
         if not args.no_changelog:
             after = _collect_summaries(OUTPUT_PATH)
             run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
-            changelog_path = generate_changelog(before, after, 0, 0, run_label)
+            changelog_path = generate_changelog(
+                before, after, [], _new_followup_lines(nf_before), run_label
+            )
             _print(f"Changelog: {changelog_path}")
         return
 
@@ -404,11 +510,12 @@ def main() -> None:
         if answer != "y":
             return
         before = _collect_summaries(OUTPUT_PATH)
+        nf_before = _read_followup_lines()
         _run_script(["--summary-only"])
         if not args.no_changelog:
             after = _collect_summaries(OUTPUT_PATH)
             run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
-            generate_changelog(before, after, 0, 0, run_label)
+            generate_changelog(before, after, [], _new_followup_lines(nf_before), run_label)
         return
 
     answer = input(f"\nAnalyze {len(new_transcripts)} transcript(s) and update summaries? (Y/n): ").strip().lower()
@@ -416,22 +523,22 @@ def main() -> None:
         _print("Cancelled.")
         return
 
-    # Snapshot summaries before run
+    # Snapshot state before run
     before = _collect_summaries(OUTPUT_PATH)
+    nf_before = _read_followup_lines()
 
     # Phase 1: transcript analysis
     _rule("Analyzing transcripts")
-    rc1 = _run_script(["--transcript-only"])
+    _run_script(["--transcript-only"])
 
     # Phase 2: summaries
     _rule("Updating summaries")
-    rc2 = _run_script(["--summary-only"])
+    _run_script(["--summary-only"])
 
-    # Count failures from NEEDS_FOLLOWUP.txt entries added this run
-    nf_path = OUTPUT_PATH / "NEEDS_FOLLOWUP.txt"
-    failed_count = 0
-    if nf_path.exists():
-        failed_count = len(nf_path.read_text(encoding="utf-8").strip().splitlines())
+    this_run_issues = _new_followup_lines(nf_before)
+
+    # Context review suggestions
+    _generate_context_review(new_transcripts)
 
     # Find most recent log
     log_path = None
@@ -449,15 +556,15 @@ def main() -> None:
         run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
         changelog_path = generate_changelog(
             before, after,
-            processed_count=len(new_transcripts),
-            failed_count=failed_count,
+            processed_files=new_transcripts,
+            this_run_issues=this_run_issues,
             run_label=run_label,
         )
 
     _print_status_report(
         new_count=len(new_transcripts),
         done_count=len(done_transcripts),
-        failed_count=failed_count,
+        failed_count=len(this_run_issues),
         changelog_path=changelog_path,
         log_path=log_path,
     )
