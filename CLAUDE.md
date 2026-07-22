@@ -21,7 +21,7 @@ Scripts in `archive/` are retired (`analyze.py`, `analyze_uc.py`, `whisper_batch
 
 ```bash
 pip install -r requirements.txt
-# edit .env: set TRANSCRIPTS_PATH (and optionally OUTPUT_PATH)
+# edit .env: set TRANSCRIPTS_PATH (and optionally OUTPUT_PATH, RECORDINGS_PATH, STAGING_PATH)
 # or just run: python run.py  — setup wizard runs on first launch
 ```
 

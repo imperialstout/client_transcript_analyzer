@@ -42,6 +42,15 @@ OUTPUT_PATH = Path(os.environ.get("OUTPUT_PATH", _HERE / "output"))
 COPILOT_TIMEOUT_SECONDS = int(os.environ.get("COPILOT_TIMEOUT_SECONDS", "900"))
 MODEL_CHANGELOG = os.environ.get("COPILOT_MODEL_SUMMARY", "auto")
 
+# Optional: separate source folder for raw MP4s (e.g. OneDrive-synced Recordings folder).
+# When set, MP4s are copied one at a time to STAGING_PATH, transcribed, and deleted.
+# VTTs land in TRANSCRIPTS_PATH, mirroring the subfolder structure from RECORDINGS_PATH.
+# If not set, run.py falls back to scanning TRANSCRIPTS_PATH for MP4s (original behaviour).
+RECORDINGS_PATH_RAW = os.environ.get("RECORDINGS_PATH", "").strip()
+RECORDINGS_PATH = Path(RECORDINGS_PATH_RAW) if RECORDINGS_PATH_RAW else None
+STAGING_PATH_RAW = os.environ.get("STAGING_PATH", "").strip()
+STAGING_PATH = Path(STAGING_PATH_RAW) if STAGING_PATH_RAW else (_HERE / "staging")
+
 
 # ---------------------------------------------------------------------------
 # Long-path-safe file I/O (mirrors analyze_copilot.py)
@@ -513,11 +522,23 @@ def _print_status_report(
 # Main
 # ---------------------------------------------------------------------------
 
-def _scan_mp4s(root: Path) -> list[Path]:
-    """Return MP4 files that have no corresponding VTT already in the same folder."""
+def _scan_mp4s(recordings_root: Path, transcripts_root: Path | None = None) -> list[Path]:
+    """Return MP4 files that have no corresponding VTT.
+
+    If transcripts_root is provided (RECORDINGS_PATH mode), VTT existence is checked
+    in transcripts_root using the same relative subfolder structure. Otherwise falls back
+    to checking for a .vtt sibling of each MP4.
+    """
     untranscribed: list[Path] = []
-    for mp4 in sorted(root.rglob("*.mp4")):
-        vtt = mp4.with_suffix(".vtt")
+    for mp4 in sorted(recordings_root.rglob("*.mp4")):
+        if transcripts_root:
+            try:
+                rel = mp4.relative_to(recordings_root)
+            except ValueError:
+                rel = Path(mp4.name)
+            vtt = transcripts_root / rel.with_suffix(".vtt")
+        else:
+            vtt = mp4.with_suffix(".vtt")
         if not vtt.exists():
             untranscribed.append(mp4)
     return untranscribed
@@ -554,7 +575,7 @@ def main() -> None:
     # Setup
     if args.setup or not SETUP_MARKER.exists():
         _print("[bold]First-time setup required. Launching wizard...[/bold]" if console else "First-time setup required. Launching wizard...")
-        result = subprocess.run([sys.executable, str(_HERE / "setup_wizard.py")])
+        result = subprocess.run([sys.executable, str(_HERE / "setup_wizard.py"), "--reset"])
         if result.returncode != 0:
             sys.exit("Setup did not complete. Run 'python setup_wizard.py' to try again.")
         load_dotenv(_PROJECT_ENV, override=True)
@@ -603,7 +624,8 @@ def main() -> None:
     # Scan: count transcripts and untranscribed videos
     # ---------------------------------------------------------------------------
     new_transcripts, done_transcripts = scan_transcripts(TRANSCRIPTS_PATH)
-    untranscribed_mp4s = _scan_mp4s(TRANSCRIPTS_PATH)
+    mp4_source = RECORDINGS_PATH if (RECORDINGS_PATH and RECORDINGS_PATH.exists()) else TRANSCRIPTS_PATH
+    untranscribed_mp4s = _scan_mp4s(mp4_source, TRANSCRIPTS_PATH if RECORDINGS_PATH else None)
     total_vtts = len(new_transcripts) + len(done_transcripts)
 
     if console:
@@ -637,15 +659,31 @@ def main() -> None:
         )
         answer = input(f"  Transcribe now before analysis? (Y/n): ").strip().lower()
         if answer != "n":
-            # Find source folders — transcribe each unique parent dir
             source_dirs = sorted({mp4.parent for mp4 in untranscribed_mp4s})
             for source_dir in source_dirs:
                 _rule(f"Transcribing {source_dir.name}")
-                subprocess.run([
-                    sys.executable, str(_HERE / "transcribe_batch.py"),
-                    "--source", str(source_dir),
-                    "--output", str(source_dir),
-                ])
+                # When using RECORDINGS_PATH, mirror the subfolder under TRANSCRIPTS_PATH
+                # and stage each MP4 locally so the OneDrive source stays uncluttered.
+                if RECORDINGS_PATH and RECORDINGS_PATH.exists():
+                    try:
+                        rel = source_dir.relative_to(RECORDINGS_PATH)
+                    except ValueError:
+                        rel = Path(source_dir.name)
+                    output_dir = TRANSCRIPTS_PATH / rel
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    cmd = [
+                        sys.executable, str(_HERE / "transcribe_batch.py"),
+                        "--source", str(source_dir),
+                        "--output", str(output_dir),
+                        "--staging", str(STAGING_PATH),
+                    ]
+                else:
+                    cmd = [
+                        sys.executable, str(_HERE / "transcribe_batch.py"),
+                        "--source", str(source_dir),
+                        "--output", str(source_dir),
+                    ]
+                subprocess.run(cmd)
             # Re-scan after transcription
             new_transcripts, done_transcripts = scan_transcripts(TRANSCRIPTS_PATH)
             total_vtts = len(new_transcripts) + len(done_transcripts)

@@ -76,9 +76,13 @@ Edit the `.env`:
 GITHUB_TOKEN=ghp_...          # GitHub PAT with models:read scope
 TRANSCRIPTS_PATH=/path/to/transcripts
 OUTPUT_PATH=./output          # optional, defaults to ./output
+
+# If your MP4 recordings live on OneDrive/SharePoint (separate from transcripts):
+RECORDINGS_PATH=C:\Users\you\Siemens AG\SX3SCPQ... - Recordings
+STAGING_PATH=C:\tmp\transcript_staging   # optional, defaults to ./staging
 ```
 
-The scripts now load `.env` from the project root first. The old `~/.config/client-transcript-analyzer/.env` location is only a fallback for legacy setups.
+The scripts load `.env` from the project root first. The old `~/.config/client-transcript-analyzer/.env` location is only a fallback for legacy setups.
 
 **3. Populate `client_context/` (gitignored — copy manually)**
 
@@ -215,6 +219,19 @@ python transcribe_batch.py --source "C:\Recordings" --output "C:\Transcripts" --
 # Walk subfolders
 python transcribe_batch.py --source "C:\Recordings" --output "C:\Transcripts" --recurse
 ```
+
+**Low-disk / OneDrive source:**
+
+If MP4s live on a synced OneDrive/SharePoint folder and your VM doesn't have enough disk to hold them all, use `--staging`. Each file is copied locally, transcribed, then deleted before the next one starts. Peak disk usage is one MP4 (~600 MB) plus working space.
+
+```powershell
+python transcribe_batch.py `
+  --source "C:\Users\you\Siemens AG\SX3SCPQ... - Recordings\ARM" `
+  --output "C:\Transcripts\ARM" `
+  --staging "C:\tmp\transcript_staging"
+```
+
+Or configure `RECORDINGS_PATH` and `STAGING_PATH` in `.env` and let `run.py` handle it automatically — it detects unprocessed recordings, offers to transcribe them, and mirrors the subfolder structure into `TRANSCRIPTS_PATH`.
 
 **Models:**
 

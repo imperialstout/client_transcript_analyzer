@@ -6,9 +6,14 @@ Usage:
     python transcribe_batch.py --source "..." --output "..." --model medium
     python transcribe_batch.py --source "..." --output "..." --recurse
     python transcribe_batch.py --source "..." --output "..." --timeout 7200
+    python transcribe_batch.py --source "..." --output "..." --staging "C:\\tmp\\staging"
 
 Resume-safe: skips files whose .vtt already exists in --output.
 Times out per-file after --timeout seconds (default 5400 = 90 min), logs to NEEDS_FOLLOWUP.txt.
+
+--staging: copy each MP4 to a local staging folder before transcribing, then delete it.
+  Use this when --source is a network/OneDrive path to avoid keeping large video files locally.
+  Only one file is staged at a time; disk headroom needed = one MP4 + working space (~1 GB typical).
 
 Requires:
     pip install faster-whisper
@@ -149,15 +154,21 @@ def main() -> None:
                         help=f"Seconds before a single file is abandoned (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--recurse", action="store_true",
                         help="Walk subfolders of --source")
+    parser.add_argument("--staging", default=None,
+                        help="Local folder to stage one MP4 at a time (copy-transcribe-delete). "
+                             "Use when --source is a network/OneDrive path to avoid filling local disk.")
     args = parser.parse_args()
 
     source = Path(args.source)
     output = Path(args.output)
+    staging = Path(args.staging) if args.staging else None
 
     if not source.exists():
         sys.exit(f"Source folder not found: {source}")
 
     output.mkdir(parents=True, exist_ok=True)
+    if staging:
+        staging.mkdir(parents=True, exist_ok=True)
     log_path      = output / "transcribe_batch_log.txt"
     followup_path = output / "NEEDS_FOLLOWUP.txt"
 
@@ -191,8 +202,23 @@ def main() -> None:
             skipped += 1
             continue
 
-        if not _has_audio(file):
+        # Stage the file locally if requested (copy from network, delete after)
+        local_file = file
+        if staging:
+            local_file = staging / file.name
+            _log(log_path, f"{prefix} [copy] {file.name} -> {staging} ...")
+            try:
+                shutil.copy2(str(file), str(local_file))
+            except Exception as exc:
+                _log(log_path, f"{prefix} [error] {file.name} — copy to staging failed: {exc}")
+                _log_followup(followup_path, file.name, f"COPY ERROR: {exc}")
+                failed += 1
+                continue
+
+        if not _has_audio(local_file):
             _log(log_path, f"{prefix} [no-audio] {file.name} — no audio stream, skipping")
+            if staging and local_file.exists():
+                local_file.unlink(missing_ok=True)
             skipped += 1
             continue
 
@@ -202,7 +228,7 @@ def main() -> None:
         result_queue = ctx.Queue()
         proc = ctx.Process(
             target=_transcribe_worker,
-            args=(str(file), str(output), args.model, result_queue),
+            args=(str(local_file), str(output), args.model, result_queue),
             daemon=True,
         )
         proc.start()
@@ -216,9 +242,10 @@ def main() -> None:
             _log(log_path, f"{prefix} [timeout] {file.name} — {msg}")
             _log_followup(followup_path, file.name, msg)
             failed += 1
-            # Clean up partial VTT if it exists
             if vtt_out.exists():
                 vtt_out.unlink(missing_ok=True)
+            if staging and local_file.exists():
+                local_file.unlink(missing_ok=True)
             continue
 
         try:
@@ -227,6 +254,10 @@ def main() -> None:
             status, detail = "error", "worker exited with no result"
 
         elapsed = int(time.monotonic() - t_start)
+
+        if staging and local_file.exists():
+            local_file.unlink(missing_ok=True)
+            _log(log_path, f"{prefix} [staged-cleanup] {local_file.name} removed from staging")
 
         if status == "ok":
             done += 1
