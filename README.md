@@ -2,16 +2,30 @@
 
 Bulk-analyzes Teams meeting transcripts and produces structured summaries keyed to a backlog of design features.
 
-Four scripts, two phases:
+## Quick start (new users)
+
+```powershell
+python run.py
+```
+
+That's it. On first launch, `run.py` detects that setup hasn't been done and walks you through everything interactively — dependencies, Copilot auth, folder configuration. On subsequent runs it scans for new transcripts, analyzes them, updates summaries, and writes a changelog showing what shifted since last time.
+
+To redo setup at any time: `python run.py --setup`
+
+---
+
+## Scripts overview
 
 | Script | Purpose |
 |--------|---------|
-| `transcribe_batch.py` | **Phase 0** — batch-transcribe MP4 recordings to VTT using faster-whisper |
-| `analyze_copilot.py` | **Phase 1** — BU-flat pipeline using GitHub Copilot CLI (primary active script) |
-| `analyze.py` | Phase 1 alternative — same pipeline via direct GitHub Models API |
-| `analyze_uc.py` | Phase 2 — maps transcripts to backlog features, produces gap report |
+| `run.py` | **Daily driver** — guided setup on first run, then scan → analyze → summarize → changelog |
+| `setup_wizard.py` | First-time setup wizard (called automatically by `run.py`) |
+| `transcribe_batch.py` | Batch-transcribe MP4 recordings to VTT using faster-whisper |
+| `analyze_copilot.py` | BU-flat analysis pipeline via GitHub Copilot CLI (called by `run.py`) |
+| `analyze.py` | Alternative — same pipeline via direct GitHub Models API |
+| `analyze_uc.py` | Use-case pipeline — maps transcripts to backlog features, produces gap report |
 
-**Start with `transcribe_batch.py`** if you have raw MP4s. Then run `analyze_copilot.py` to produce summaries. Use `analyze_uc.py` when you want capability/use-case alignment against the backlog.
+For most users: **only `run.py` is needed day-to-day.**
 
 ---
 
