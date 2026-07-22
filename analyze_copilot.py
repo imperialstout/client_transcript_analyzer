@@ -52,6 +52,12 @@ MODEL_SUMMARY = os.environ.get("COPILOT_MODEL_SUMMARY", "auto")
 RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP", "2"))
 QC_THRESHOLD_DEFAULT = int(os.environ.get("QC_THRESHOLD", "0"))
 
+# Hard ceiling per Copilot CLI call. Most transcripts finish in a few
+# minutes; an occasional one may legitimately run long, but a call that
+# never returns should not stall the whole batch. Anything that times out
+# gets logged to NEEDS_FOLLOWUP.txt and skipped so the run keeps moving.
+COPILOT_TIMEOUT_SECONDS = int(os.environ.get("COPILOT_TIMEOUT_SECONDS", "900"))
+
 # ---------------------------------------------------------------------------
 # Copilot CLI client
 # ---------------------------------------------------------------------------
@@ -132,6 +138,7 @@ def _run_copilot(
                         stdout=stdout_f,
                         stderr=stderr_f,
                         text=True,
+                        timeout=COPILOT_TIMEOUT_SECONDS,
                     )
                     del proc
             except FileNotFoundError as exc:
@@ -143,6 +150,14 @@ def _run_copilot(
                     continue
                 raise RuntimeError(
                     "GitHub Copilot CLI is not available. Install it and ensure 'copilot --version' works in this shell."
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                # A single call that never returns should not stall the whole
+                # batch. Don't retry (a hang is unlikely to resolve itself);
+                # surface a clear, distinguishable error so callers can log
+                # this file for follow-up and move on to the next one.
+                raise TimeoutError(
+                    f"Copilot CLI call exceeded {COPILOT_TIMEOUT_SECONDS}s timeout"
                 ) from exc
             except subprocess.CalledProcessError as exc:
                 stderr = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
@@ -474,6 +489,20 @@ def qc_report_path() -> Path:
     return OUTPUT_PATH / "[QC REPORT] transcript_quality.md"
 
 
+def needs_followup_path() -> Path:
+    return OUTPUT_PATH / "NEEDS_FOLLOWUP.txt"
+
+
+def log_needs_followup(bu: str, vtt_name: str, reason: str) -> None:
+    """Append a one-line record of a failed/timed-out transcript so problem
+    files are easy to spot and revisit later, without blocking the batch."""
+    path = needs_followup_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).isoformat()
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{timestamp} | {bu} | {vtt_name} | {reason}\n")
+
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -763,6 +792,19 @@ def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -
         print("done")
         time.sleep(RATE_LIMIT_SLEEP)
         return result
+    except TimeoutError as e:
+        print(f"TIMEOUT: {e}", file=sys.stderr)
+        _write_meta(meta_out, {
+            **source_sig,
+            "status": "timeout",
+            "error": str(e),
+            "qc_threshold": qc_threshold,
+            "model_transcript": MODEL_TRANSCRIPT,
+            "system_signature": system_sig,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+        })
+        log_needs_followup(bu, vtt.name, f"TIMEOUT: {e}")
+        return None
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         _write_meta(meta_out, {
@@ -774,6 +816,7 @@ def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -
             "system_signature": system_sig,
             "updated_at_utc": datetime.now(UTC).isoformat(),
         })
+        log_needs_followup(bu, vtt.name, f"ERROR: {e}")
         return None
 
 
