@@ -224,6 +224,14 @@ def main() -> None:
             if not copy_ok:
                 failed += 1
                 continue
+            # Evict the source file back to cloud-only so the OneDrive sync
+            # folder doesn't accumulate local copies and fill the disk.
+            if os.name == "nt":
+                try:
+                    import subprocess as _sp
+                    _sp.run(["attrib", "+U", "-P", str(file)], check=False, capture_output=True)
+                except Exception:
+                    pass  # non-fatal — worst case OneDrive keeps a local copy
 
         if not _has_audio(local_file):
             _log(log_path, f"{prefix} [no-audio] {file.name} — no audio stream, skipping")
