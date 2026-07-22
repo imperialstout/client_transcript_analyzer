@@ -3,6 +3,8 @@ client_context/*
 client_data/
 HANDOVER.md
 output/
+output_*/
+_copilot_single_test/
 .env
 *.pyc
 __pycache__/

@@ -28,6 +28,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -120,14 +122,63 @@ class Feature:
 _client: OpenAI | None = None
 
 
+def _gh_executable() -> str:
+    gh_path = shutil.which("gh")
+    if gh_path:
+        return gh_path
+
+    candidates: list[str] = []
+    if os.name == "nt":
+        program_files = os.environ.get("ProgramFiles", "")
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        user_profile = os.environ.get("USERPROFILE", "")
+        candidates.extend([
+            os.path.join(program_files, "GitHub CLI", "gh.exe"),
+            os.path.join(local_app_data, "Programs", "GitHub CLI", "gh.exe"),
+            os.path.join(user_profile, "AppData", "Local", "Microsoft", "WinGet", "Links", "gh.exe"),
+        ])
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    return "gh"
+
+
+def _resolve_github_token() -> str:
+    if GITHUB_TOKEN:
+        return GITHUB_TOKEN
+
+    try:
+        result = subprocess.run(
+            [_gh_executable(), "auth", "token"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "GitHub authentication is missing. Set GITHUB_TOKEN in .env or install GitHub CLI and run 'gh auth login'."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "GitHub authentication is missing. Set GITHUB_TOKEN in .env or run 'gh auth login'."
+        ) from exc
+
+    token = result.stdout.strip()
+    if not token:
+        raise RuntimeError(
+            "GitHub authentication is missing. Set GITHUB_TOKEN in .env or run 'gh auth login'."
+        )
+    return token
+
+
 def _api() -> OpenAI:
     global _client
     if _client is None:
-        if not GITHUB_TOKEN:
-            raise RuntimeError("GITHUB_TOKEN is missing. Set it in ~/.config/client-transcript-analyzer/.env")
         _client = OpenAI(
             base_url="https://models.inference.ai.azure.com",
-            api_key=GITHUB_TOKEN,
+            api_key=_resolve_github_token(),
         )
     return _client
 

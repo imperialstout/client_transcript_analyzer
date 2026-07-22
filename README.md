@@ -1,15 +1,16 @@
 # Client Transcript Analyzer
 
-Bulk-analyzes Teams meeting transcripts using Claude (via GitHub Models API) and produces structured summaries keyed to a backlog of design features.
+Bulk-analyzes Teams meeting transcripts and produces structured summaries keyed to a backlog of design features.
 
-Two scripts, two modes:
+Three scripts, three modes:
 
 | Script | Purpose |
 |--------|---------|
-| `analyze.py` | Original BU-flat pipeline — walks folders by business unit |
+| `analyze.py` | Transcript-first pipeline — analyzes each transcript individually, with optional BU summaries |
+| `analyze_copilot.py` | Transcript-first pipeline using GitHub Copilot CLI instead of direct API calls |
 | `analyze_uc.py` | Use-case pipeline — maps transcripts to backlog features, produces gap report |
 
-For new work, use `analyze_uc.py`.
+For stage 1 work, use `analyze.py` first. Move to `analyze_uc.py` later when you want capability or use-case alignment.
 
 ---
 
@@ -204,11 +205,14 @@ QC_THRESHOLD=70
 
 ## analyze.py — BU-Flat Pipeline
 
-Original pipeline. Walks `TRANSCRIPTS_PATH` for `.vtt` files grouped by immediate subfolder (= BU name).
+Transcript-first pipeline. Walks `TRANSCRIPTS_PATH` for `.vtt` and `.txt` files grouped by immediate subfolder (= BU name), writes one `[ANALYZED].txt` per transcript, and can optionally generate BU summaries.
 
 ```bash
 python analyze.py                  # all BUs
 python analyze.py --bu "ARM"       # single BU
+python analyze.py --transcript-only # per-transcript analyses only, no BU rollups
+python analyze.py --qc-only         # transcript quality pre-check, no API calls
+python analyze.py --qc-threshold 70 # skip transcripts below QC score 70 during analysis
 python analyze.py --summary-only   # re-run summaries from existing [ANALYZED] files
 ```
 
@@ -218,8 +222,50 @@ python analyze.py --summary-only   # re-run summaries from existing [ANALYZED] f
 output/
   <BU>/
     <filename> [ANALYZED].txt
+    <filename> [ANALYZED].meta.json
     [BU SUMMARY] <BU>.md
+  [QC REPORT] transcript_quality.md
+  logs/
+    run_<timestamp>.log
+    errors_<timestamp>.log
 ```
+
+If your immediate goal is to get a strong summary for each transcript and defer backlog/use-case alignment until later, this is the simpler path.
+
+`analyze.py` now uses the same operational safeguards as the UC pipeline:
+
+- `.vtt` and `.txt` inputs are both supported
+- each transcript gets metadata sidecar caching via `[ANALYZED].meta.json`
+- reprocessing happens automatically when the source file, prompt context, or model changes
+- `--qc-only` generates a heuristic transcript quality report before any API calls
+- `--qc-threshold` can block low-quality transcripts from analysis
+- each run writes full and error-only logs under `output/logs/`
+
+---
+
+## analyze_copilot.py — BU-Flat Pipeline via Copilot CLI
+
+`analyze_copilot.py` keeps the same BU pipeline behavior as `analyze.py`, but replaces direct model API calls with `copilot -p ... -s` requests. This avoids PAT/API plumbing and works with your signed-in Copilot session.
+
+```bash
+python analyze_copilot.py
+python analyze_copilot.py --bu "ARM"
+python analyze_copilot.py --transcript-only
+python analyze_copilot.py --qc-only
+python analyze_copilot.py --summary-only
+```
+
+Optional model overrides for Copilot CLI:
+
+```text
+COPILOT_MODEL_TRANSCRIPT=auto
+COPILOT_MODEL_SUMMARY=auto
+```
+
+Notes:
+
+- Large transcript/summary payloads are sent as temporary attachments to avoid command-length limits.
+- Run `copilot --version` once in the same shell to verify the CLI is available.
 
 ---
 
