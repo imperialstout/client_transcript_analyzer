@@ -2,15 +2,16 @@
 
 Bulk-analyzes Teams meeting transcripts and produces structured summaries keyed to a backlog of design features.
 
-Three scripts, three modes:
+Four scripts, two phases:
 
 | Script | Purpose |
 |--------|---------|
-| `analyze.py` | Transcript-first pipeline — analyzes each transcript individually, with optional BU summaries |
-| `analyze_copilot.py` | Transcript-first pipeline using GitHub Copilot CLI instead of direct API calls |
-| `analyze_uc.py` | Use-case pipeline — maps transcripts to backlog features, produces gap report |
+| `transcribe_batch.py` | **Phase 0** — batch-transcribe MP4 recordings to VTT using faster-whisper |
+| `analyze_copilot.py` | **Phase 1** — BU-flat pipeline using GitHub Copilot CLI (primary active script) |
+| `analyze.py` | Phase 1 alternative — same pipeline via direct GitHub Models API |
+| `analyze_uc.py` | Phase 2 — maps transcripts to backlog features, produces gap report |
 
-For stage 1 work, use `analyze.py` first. Move to `analyze_uc.py` later when you want capability or use-case alignment.
+**Start with `transcribe_batch.py`** if you have raw MP4s. Then run `analyze_copilot.py` to produce summaries. Use `analyze_uc.py` when you want capability/use-case alignment against the backlog.
 
 ---
 
@@ -18,7 +19,8 @@ For stage 1 work, use `analyze.py` first. Move to `analyze_uc.py` later when you
 
 - Python 3.9+
 - A GitHub PAT with `models:read` scope → [github.com/settings/tokens](https://github.com/settings/tokens)
-- Transcript files (`.vtt` or `.txt`) on disk
+- Transcript files (`.vtt` or `.txt`) on disk — or MP4 recordings (see `transcribe_batch.py`)
+- `ffmpeg` in PATH for transcription: `winget install Gyan.FFmpeg`
 
 ---
 
@@ -291,15 +293,37 @@ RATE_LIMIT_SLEEP=2
 
 ## Getting Transcripts
 
-**Option A — Whisper from MP4 (recommended)**
+**Option A — `transcribe_batch.py` (recommended)**
 
-If you have the raw recordings locally:
+Batch-transcribes a folder of MP4 recordings to VTT using `faster-whisper`. Resume-safe, per-file timeout, failures logged to `NEEDS_FOLLOWUP.txt`.
 
 ```powershell
-whisper "meeting.mp4" --model medium --output_format vtt --output_dir C:\Transcripts
+# Install once
+pip install faster-whisper
+winget install Gyan.FFmpeg   # restart shell after
+
+# Test on one folder
+python transcribe_batch.py --source "C:\Recordings\unsorted" --output "C:\Transcripts\unsorted"
+
+# With model and timeout override
+python transcribe_batch.py --source "C:\Recordings" --output "C:\Transcripts" --model medium --timeout 10800
+
+# Walk subfolders
+python transcribe_batch.py --source "C:\Recordings" --output "C:\Transcripts" --recurse
 ```
 
-Note: `ffmpeg` must be installed (`winget install Gyan.FFmpeg`). CPU speed is ~0.25x realtime with `medium`; use `--model small` for 4-5x speedup with acceptable accuracy loss.
+**Models:**
+
+| Model | Speed (CPU) | Notes |
+|-------|-------------|-------|
+| `tiny` | ~8x realtime | Very fast; accuracy drops noticeably |
+| `small` | ~4x realtime | **Default.** Good balance for English meeting audio |
+| `medium` | ~1x realtime | Better accuracy; slower |
+| `large-v2` | ~0.5x realtime | Best accuracy; plan for overnight runs |
+
+`faster-whisper` uses `int8` quantization and VAD filtering (skips silence) — significantly faster than `openai-whisper` on the same hardware.
+
+Note: transcripts produced by Whisper have no speaker attribution. The downstream analyzer extracts requirements and decisions from content alone, which is sufficient for discovery/design work.
 
 **Option B — SharePoint VTT download**
 
