@@ -513,10 +513,36 @@ def _print_status_report(
 # Main
 # ---------------------------------------------------------------------------
 
+def _scan_mp4s(root: Path) -> list[Path]:
+    """Return MP4 files that have no corresponding VTT already in the same folder."""
+    untranscribed: list[Path] = []
+    for mp4 in sorted(root.rglob("*.mp4")):
+        vtt = mp4.with_suffix(".vtt")
+        if not vtt.exists():
+            untranscribed.append(mp4)
+    return untranscribed
+
+
+def _estimate_transcription_time(count: int, model: str = "small") -> str:
+    # Rough real-world estimates for CPU transcription on a typical meeting recording.
+    # Based on ~1-hr average meeting length at the documented rates.
+    hours_per_file = {"tiny": 0.15, "small": 0.3, "medium": 1.0, "large-v2": 2.0}
+    h = hours_per_file.get(model, 0.3) * count
+    if h < 1:
+        return f"~{int(h * 60)} minutes"
+    return f"~{h:.1f} hours"
+
+
+def _run_uc_gap_report() -> None:
+    """Regenerate the gap report (no API calls)."""
+    subprocess.run([sys.executable, str(_HERE / "analyze_copilot.py"), "--uc", "--gap-only"])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Transcript analyzer — daily driver")
     parser.add_argument("--setup", action="store_true", help="Re-run the setup wizard")
     parser.add_argument("--qc-only", action="store_true", help="Quality check only, no API calls")
+    parser.add_argument("--gap-only", action="store_true", help="Regenerate gap report only (no API calls)")
     parser.add_argument("--summary-only", action="store_true", help="Re-run summaries from existing analyses")
     parser.add_argument("--no-changelog", action="store_true", help="Skip changelog generation")
     parser.add_argument(
@@ -531,7 +557,6 @@ def main() -> None:
         result = subprocess.run([sys.executable, str(_HERE / "setup_wizard.py")])
         if result.returncode != 0:
             sys.exit("Setup did not complete. Run 'python setup_wizard.py' to try again.")
-        # Reload env after setup
         load_dotenv(_PROJECT_ENV, override=True)
         if args.setup:
             return
@@ -546,6 +571,12 @@ def main() -> None:
 
     _rule("Transcript Analyzer")
 
+    # Gap-only shortcut — pure data, no API calls
+    if args.gap_only:
+        _print("Regenerating gap report (no API calls) ...")
+        _run_uc_gap_report()
+        return
+
     # QC-only shortcut
     if args.qc_only:
         _print("Running quality check only ...")
@@ -557,7 +588,8 @@ def main() -> None:
         _print("Re-running summaries from existing analyses ...")
         before = _collect_summaries(OUTPUT_PATH)
         nf_before = _read_followup_lines()
-        _run_script_or_die(["--summary-only"], "summary regeneration")
+        _run_script_or_die(["--uc", "--summary-only"], "summary regeneration")
+        _run_uc_gap_report()
         if not args.no_changelog:
             after = _collect_summaries(OUTPUT_PATH)
             run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
@@ -567,34 +599,75 @@ def main() -> None:
             _print(f"Changelog: {changelog_path}")
         return
 
-    # Normal run
+    # ---------------------------------------------------------------------------
+    # Scan: count transcripts and untranscribed videos
+    # ---------------------------------------------------------------------------
     new_transcripts, done_transcripts = scan_transcripts(TRANSCRIPTS_PATH)
-    total = len(new_transcripts) + len(done_transcripts)
+    untranscribed_mp4s = _scan_mp4s(TRANSCRIPTS_PATH)
+    total_vtts = len(new_transcripts) + len(done_transcripts)
 
     if console:
         table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
         table.add_column("", style="bold")
         table.add_column("")
-        table.add_row("Total transcripts found", str(total))
-        table.add_row("Already analyzed", str(len(done_transcripts)))
-        table.add_row("New or changed", str(len(new_transcripts)))
+        table.add_row("Transcript files (.vtt/.txt)", str(total_vtts))
+        table.add_row("  Already analyzed",           str(len(done_transcripts)))
+        table.add_row("  New or changed",             str(len(new_transcripts)))
+        if untranscribed_mp4s:
+            table.add_row("Video files needing transcription", str(len(untranscribed_mp4s)))
         console.print(table)
     else:
-        print(f"  Total transcripts : {total}")
-        print(f"  Already analyzed  : {len(done_transcripts)}")
-        print(f"  New or changed    : {len(new_transcripts)}")
+        print(f"  Transcript files (.vtt/.txt) : {total_vtts}")
+        print(f"    Already analyzed           : {len(done_transcripts)}")
+        print(f"    New or changed             : {len(new_transcripts)}")
+        if untranscribed_mp4s:
+            print(f"  Video files needing transcription : {len(untranscribed_mp4s)}")
 
+    # ---------------------------------------------------------------------------
+    # Offer transcription if MP4s are present
+    # ---------------------------------------------------------------------------
+    if untranscribed_mp4s:
+        est = _estimate_transcription_time(len(untranscribed_mp4s))
+        _print(
+            f"\n  {len(untranscribed_mp4s)} video file(s) have no transcript yet. "
+            f"Transcription will take {est} and runs unattended."
+            if not console else
+            f"\n  [yellow]{len(untranscribed_mp4s)} video file(s) have no transcript yet.[/yellow] "
+            f"Transcription will take {est} and runs unattended."
+        )
+        answer = input(f"  Transcribe now before analysis? (Y/n): ").strip().lower()
+        if answer != "n":
+            # Find source folders — transcribe each unique parent dir
+            source_dirs = sorted({mp4.parent for mp4 in untranscribed_mp4s})
+            for source_dir in source_dirs:
+                _rule(f"Transcribing {source_dir.name}")
+                subprocess.run([
+                    sys.executable, str(_HERE / "transcribe_batch.py"),
+                    "--source", str(source_dir),
+                    "--output", str(source_dir),
+                ])
+            # Re-scan after transcription
+            new_transcripts, done_transcripts = scan_transcripts(TRANSCRIPTS_PATH)
+            total_vtts = len(new_transcripts) + len(done_transcripts)
+            _print(f"\n  After transcription: {total_vtts} transcripts total, {len(new_transcripts)} new/changed.")
+        else:
+            _print("  Skipping transcription. Videos will be analyzed once transcribed.")
+
+    # ---------------------------------------------------------------------------
+    # Nothing to analyze
+    # ---------------------------------------------------------------------------
     if not new_transcripts:
-        _print("\nNothing to do — all transcripts are already analyzed.", style="green" if console else "")
+        _print("\nNothing to analyze — all transcripts are already up to date.", style="green" if console else "")
         if args.yes:
             answer = "y"
         else:
-            answer = input("Re-run summaries anyway? (y/N): ").strip().lower()
+            answer = input("Re-run summaries and gap report anyway? (y/N): ").strip().lower()
         if answer != "y":
             return
         before = _collect_summaries(OUTPUT_PATH)
         nf_before = _read_followup_lines()
-        _run_script_or_die(["--summary-only"], "summary regeneration")
+        _run_script_or_die(["--uc", "--summary-only"], "summary regeneration")
+        _run_uc_gap_report()
         if not args.no_changelog:
             after = _collect_summaries(OUTPUT_PATH)
             run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
@@ -609,24 +682,26 @@ def main() -> None:
         _print("Cancelled.")
         return
 
-    # Snapshot state before run
+    # ---------------------------------------------------------------------------
+    # Full run: transcripts → summaries → gap report → changelog
+    # ---------------------------------------------------------------------------
     before = _collect_summaries(OUTPUT_PATH)
     nf_before = _read_followup_lines()
 
-    # Phase 1: transcript analysis
-    _rule("Analyzing transcripts")
-    _run_script_or_die(["--transcript-only"], "transcript analysis")
+    _rule(f"Phase 1/3 — Analyzing {len(new_transcripts)} transcript(s)")
+    _print("  This may take a while. Progress is printed for each transcript.")
+    _run_script_or_die(["--uc", "--transcript-only"], "transcript analysis")
 
-    # Phase 2: summaries
-    _rule("Updating summaries")
-    _run_script_or_die(["--summary-only"], "summary generation")
+    _rule("Phase 2/3 — Updating feature and UC summaries")
+    _run_script_or_die(["--uc", "--summary-only"], "summary generation")
+
+    _rule("Phase 3/3 — Generating gap report")
+    _run_uc_gap_report()
 
     this_run_issues = _new_followup_lines(nf_before)
 
-    # Context review suggestions
     _generate_context_review(new_transcripts)
 
-    # Find most recent log
     log_path = None
     logs_dir = OUTPUT_PATH / "logs"
     if logs_dir.exists():
@@ -634,7 +709,6 @@ def main() -> None:
         if run_logs:
             log_path = run_logs[0]
 
-    # Changelog
     changelog_path = None
     if not args.no_changelog:
         _rule("Generating changelog")

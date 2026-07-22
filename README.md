@@ -26,14 +26,16 @@ Note: `--yes` only skips the confirmation prompts in the normal run flow. First-
 
 | Script | Purpose |
 |--------|---------|
-| `run.py` | **Daily driver** — guided setup on first run, then scan → analyze → summarize → changelog |
+| `run.py` | **Daily driver** — guided setup on first run, then scan → transcribe (optional) → analyze → summaries → gap report → changelog |
 | `setup_wizard.py` | First-time setup wizard (called automatically by `run.py`) |
 | `transcribe_batch.py` | Batch-transcribe MP4 recordings to VTT using faster-whisper |
-| `analyze_copilot.py` | BU-flat analysis pipeline via GitHub Copilot CLI (called by `run.py`) |
-| `analyze.py` | Alternative — same pipeline via direct GitHub Models API |
-| `analyze_uc.py` | Use-case pipeline — maps transcripts to backlog features, produces gap report |
+| `analyze_copilot.py` | Analysis engine — BU pipeline and UC/feature pipeline with gap report |
 
 For most users: **only `run.py` is needed day-to-day.**
+
+Scripts in `archive/` (`analyze.py`, `analyze_uc.py`, `whisper_batch.ps1`) are retired
+— they require a GitHub PAT and the old `openai-whisper` package, neither of which work
+on the Siemens Copilot-only environment.
 
 ---
 
@@ -99,13 +101,28 @@ client_data/
 
 ---
 
-## analyze_uc.py — Use-Case Pipeline
+## UC pipeline and gap report
 
-Designed for transcripts organized under immediate subfolders of `TRANSCRIPTS_PATH` (for example `1.04 Catalogue and Pricebook/`). Folders with numeric prefixes are matched to backlog features, while unmatched folders are still analyzed and reported as unmatched in the gap report.
+`run.py` runs the UC pipeline automatically on every full run. You can also drive it directly:
 
-Files directly under `TRANSCRIPTS_PATH` are also analyzed under a synthetic `ROOT` bucket.
+```bash
+# Check coverage before any API calls (fast — pure data)
+python analyze_copilot.py --uc --gap-only
 
-**Expected `TRANSCRIPTS_PATH` layout:**
+# Full UC pipeline: analyze all features, UC summaries, gap report
+python analyze_copilot.py --uc
+
+# Single feature
+python analyze_copilot.py --uc --feature 1.04
+
+# Re-run summaries from existing analyses
+python analyze_copilot.py --uc --summary-only
+
+# Quality check (no API calls)
+python analyze_copilot.py --uc --qc-only
+```
+
+**Expected `TRANSCRIPTS_PATH` layout for UC pipeline:**
 
 ```
 TRANSCRIPTS_PATH/
@@ -114,182 +131,47 @@ TRANSCRIPTS_PATH/
     recording2.vtt
   1.05 Quote Cloning and Versioning/
     recording1.vtt
-  1.09 Approval Workflow/
-    ...
 ```
 
-Folder names are matched by the leading numeric prefix (`1.04`, `2.01`, etc.) — exact name or typos after the prefix don't matter.
+Folder names are matched by leading numeric prefix (`1.04`, `2.01`, etc.) — typos after the prefix don't matter.
 
-Accepted transcript formats are `.vtt` and `.txt`.
-
-**Commands:**
-
-```bash
-# Check coverage before running any API calls
-python analyze_uc.py --gap-only
-
-# Quality-check transcript text before running API calls
-python analyze_uc.py --qc-only
-
-# Block low-quality transcripts from analysis (example threshold: 70)
-python analyze_uc.py --qc-threshold 70
-
-# Full pipeline: analyze all features, generate UC summaries + gap report
-python analyze_uc.py
-
-# Single feature (by numeric prefix)
-python analyze_uc.py --feature 1.04
-
-# Re-run summaries from already-analyzed transcripts (no per-transcript API calls)
-python analyze_uc.py --summary-only
-```
-
-**Outputs:**
+**UC pipeline outputs:**
 
 ```
 output/
   features/
     1.04/
-      recording1 [ANALYZED].txt       ← per-transcript extraction
-      recording1 [ANALYZED].meta.json ← cache/status metadata
+      recording1 [ANALYZED].txt        ← per-transcript extraction
+      recording1 [ANALYZED].meta.json  ← cache/freshness metadata
     [FEATURE SUMMARY] 1.04 Catalogue and Pricebook.md
-  [UC SUMMARY] UC0.md                 ← synthesized across all in-scope features
+  [UC SUMMARY] UC0.md
   [UC SUMMARY] UC1.md
   [UC SUMMARY] UC2.md
-  [GAP REPORT] coverage.md            ← which backlog rows have no transcripts
-  [QC REPORT] transcript_quality.md   ← transcript quality heuristics (no API calls)
-  logs/
-    run_<timestamp>.log               ← full console output for the run
-    errors_<timestamp>.log            ← stderr/errors only
-```
-
-**Start here.** Run `--gap-only` first to see what you have before spending any API quota.
-
-### How "already processed" is determined
-
-`analyze_uc.py` now uses metadata sidecars (`[ANALYZED].meta.json`) for each transcript.
-
-A transcript is skipped only when all of the following still match:
-
-- source file hash (SHA-256)
-- source file size and modification timestamp
-- transcript model (`MODEL_TRANSCRIPT`)
-- prompt/context signature (includes base context + `solution_prompt.txt` guidance)
-
-If any of those change, the transcript is automatically reprocessed.
-
-### Transcript quality pre-check (`--qc-only`)
-
-`analyze_uc.py --qc-only` scans the same transcript set the pipeline would process (matched feature folders, unmatched folders, and root-level `.vtt`/`.txt` files) and writes:
-
-- `output/[QC REPORT] transcript_quality.md`
-
-The report assigns a heuristic quality score (`good` / `watch` / `poor`) using signals like:
-
-- very short parsed text
-- low word count
-- repeated transcript lines
-- frequent `inaudible`/`unclear` markers
-
-Use this to identify transcripts that should be re-transcribed or manually reviewed before spending model quota.
-
-### Run logs
-
-`analyze_uc.py` now writes two log files under `output/logs/` for each run:
-
-- `run_<timestamp>.log` — full run output including progress, skips, summaries, and errors
-- `errors_<timestamp>.log` — error stream only
-
-The script prints both log paths at startup.
-
-### Transcript quality gate (`--qc-threshold`)
-
-Use `--qc-threshold <0-100>` to prevent low-quality transcripts from being sent to the model at all.
-
-Example:
-
-```bash
-python analyze_uc.py --qc-threshold 70
-```
-
-Behavior:
-
-- `0` disables gating
-- transcripts with QC score below the threshold are skipped before any API call
-- skip decisions are recorded in `[ANALYZED].meta.json` with status `qc_blocked`
-- if the transcript file changes later, it is automatically reconsidered on the next run
-
-You can also set a default via env:
-
-```text
-QC_THRESHOLD=70
-```
-
----
-
-## analyze.py — BU-Flat Pipeline
-
-Transcript-first pipeline. Walks `TRANSCRIPTS_PATH` for `.vtt` and `.txt` files grouped by immediate subfolder (= BU name), writes one `[ANALYZED].txt` per transcript, and can optionally generate BU summaries.
-
-```bash
-python analyze.py                  # all BUs
-python analyze.py --bu "ARM"       # single BU
-python analyze.py --transcript-only # per-transcript analyses only, no BU rollups
-python analyze.py --qc-only         # transcript quality pre-check, no API calls
-python analyze.py --qc-threshold 70 # skip transcripts below QC score 70 during analysis
-python analyze.py --summary-only   # re-run summaries from existing [ANALYZED] files
-```
-
-**Outputs:**
-
-```
-output/
-  <BU>/
-    <filename> [ANALYZED].txt
-    <filename> [ANALYZED].meta.json
-    [BU SUMMARY] <BU>.md
+  [GAP REPORT] coverage.md             ← which backlog rows have no transcript coverage
   [QC REPORT] transcript_quality.md
   logs/
     run_<timestamp>.log
     errors_<timestamp>.log
 ```
 
-If your immediate goal is to get a strong summary for each transcript and defer backlog/use-case alignment until later, this is the simpler path.
+## BU pipeline (direct use)
 
-`analyze.py` now uses the same operational safeguards as the UC pipeline:
-
-- `.vtt` and `.txt` inputs are both supported
-- each transcript gets metadata sidecar caching via `[ANALYZED].meta.json`
-- reprocessing happens automatically when the source file, prompt context, or model changes
-- `--qc-only` generates a heuristic transcript quality report before any API calls
-- `--qc-threshold` can block low-quality transcripts from analysis
-- each run writes full and error-only logs under `output/logs/`
-
----
-
-## analyze_copilot.py — BU-Flat Pipeline via Copilot CLI
-
-`analyze_copilot.py` keeps the same BU pipeline behavior as `analyze.py`, but replaces direct model API calls with `copilot -p ... -s` requests. This avoids PAT/API plumbing and works with your signed-in Copilot session.
+If you want BU-flat summaries without UC/feature alignment:
 
 ```bash
-python analyze_copilot.py
-python analyze_copilot.py --bu "ARM"
+python analyze_copilot.py                  # all BUs
+python analyze_copilot.py --bu "ARM"       # single BU
 python analyze_copilot.py --transcript-only
-python analyze_copilot.py --qc-only
 python analyze_copilot.py --summary-only
+python analyze_copilot.py --qc-only
 ```
 
-Optional model overrides for Copilot CLI:
+Optional model overrides:
 
 ```text
 COPILOT_MODEL_TRANSCRIPT=auto
 COPILOT_MODEL_SUMMARY=auto
 ```
-
-Notes:
-
-- Large transcript/summary payloads are sent as temporary attachments to avoid command-length limits.
-- Run `copilot --version` once in the same shell to verify the CLI is available.
 
 ---
 

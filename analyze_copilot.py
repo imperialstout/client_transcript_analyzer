@@ -1,17 +1,32 @@
 """
-Client transcript analysis tool.
+Client transcript analysis tool — BU pipeline and UC/gap-report pipeline.
 
-Walks TRANSCRIPTS_PATH for .vtt files organized by BU subfolder,
-converts each to clean text, analyzes with GitHub Copilot CLI,
-and produces per-BU summary files in OUTPUT_PATH.
+BU PIPELINE (default):
+    Walks TRANSCRIPTS_PATH for .vtt/.txt files by subfolder (= BU name),
+    analyzes each transcript with Copilot CLI, and produces per-BU summaries.
 
-Usage:
-    python analyze_copilot.py                  # process all BUs
-    python analyze_copilot.py --bu "Finance"   # single BU
-    python analyze_copilot.py --summary-only   # re-run BU summaries from existing analyses
+    python analyze_copilot.py                  # all BUs
+    python analyze_copilot.py --bu "ARM"       # single BU
+    python analyze_copilot.py --transcript-only
+    python analyze_copilot.py --summary-only
+    python analyze_copilot.py --qc-only
+    python analyze_copilot.py --qc-threshold 70
+
+UC PIPELINE:
+    Maps transcript folders to the three backlog CSVs by numeric prefix,
+    analyzes each transcript with feature-context injected, produces feature
+    summaries, UC rollups, and a gap report showing which backlog items have
+    no transcript coverage.
+
+    python analyze_copilot.py --uc             # full UC pipeline + gap report
+    python analyze_copilot.py --uc --feature 1.04  # single feature
+    python analyze_copilot.py --uc --summary-only  # re-run summaries only
+    python analyze_copilot.py --uc --gap-only      # gap report only (no API calls)
+    python analyze_copilot.py --uc --qc-only       # quality check only
 """
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -21,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
@@ -117,6 +133,140 @@ def _safe_append_text(path: Path, content: str, encoding: str = "utf-8") -> None
     with open(_long_path(path), "a", encoding=encoding) as f:
         f.write(content)
 
+
+# ---------------------------------------------------------------------------
+# UC pipeline config
+# ---------------------------------------------------------------------------
+
+_HERE = Path(__file__).parent
+CSV_UC0 = _HERE / "client_data" / "20260706_BACKLOGMASTER_INTERNAL_VER 2.0 - Epic UC0.csv"
+CSV_UC1 = _HERE / "client_data" / "20260706_BACKLOGMASTER_INTERNAL_VER 2.0 - Epic UC 1.csv"
+CSV_UC2 = _HERE / "client_data" / "20260706_BACKLOGMASTER_INTERNAL_VER 2.0 - EpicUC02 Technician Quote.csv"
+
+UC_NAMES = {
+    "UC0": "BX SaaS Quote (Use Case 0)",
+    "UC1": "SOLSYS End-to-End Quote (Use Case 1)",
+    "UC2": "SNGX Technician Quote (Use Case 2)",
+}
+
+FEATURES_OUT = OUTPUT_PATH / "features"
+
+
+def required_csv_paths() -> list[Path]:
+    return [CSV_UC0, CSV_UC1, CSV_UC2]
+
+
+# ---------------------------------------------------------------------------
+# UC data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Feature:
+    prefix: str
+    arm_name: str
+    siemens_name: str
+    definition: str
+    uc0_scope: str
+    uc1_scope: str
+    uc2_scope: str
+    sf_owner: str = ""
+    folder: "Path | None" = None
+
+    @property
+    def display_name(self) -> str:
+        return self.siemens_name if self.siemens_name and self.siemens_name.upper() != "NA" else self.arm_name
+
+    def in_scope(self, uc: str) -> bool:
+        val = {"UC0": self.uc0_scope, "UC1": self.uc1_scope, "UC2": self.uc2_scope}.get(uc, "")
+        return bool(val) and val.upper() not in ("NO", "NOT APPLICABLE", "N/A", "")
+
+    def scope_label(self, uc: str) -> str:
+        val = {"UC0": self.uc0_scope, "UC1": self.uc1_scope, "UC2": self.uc2_scope}.get(uc, "")
+        if not val or val.upper() in ("NO", "NOT APPLICABLE", "N/A"):
+            return "x"
+        if val.upper() == "YES":
+            return "Y"
+        if "UNCLEAR" in val.upper():
+            return "?"
+        return "~"
+
+
+# ---------------------------------------------------------------------------
+# Feature registry (CSV parsing)
+# ---------------------------------------------------------------------------
+
+_PREFIX_RE = re.compile(r"^(\d+\.\d+)")
+
+
+def _extract_prefix(name: str) -> str:
+    m = _PREFIX_RE.match(name.strip())
+    return m.group(1) if m else ""
+
+
+def load_feature_registry() -> dict[str, Feature]:
+    registry: dict[str, Feature] = {}
+
+    def _key(arm_name: str, siemens_name: str) -> str:
+        p = _extract_prefix(siemens_name)
+        if p:
+            return p
+        return re.sub(r"[^a-z0-9]+", "-", arm_name.lower().strip()).strip("-")
+
+    def _parse(csv_path: Path, uc_col: str, uc_attr: str) -> None:
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                arm = row.get("Epic / Capability Name(ARM)", "").strip()
+                siemens = row.get("Epic / Capability Name(Siemens)", "").strip()
+                definition = row.get("Definition", "").strip()
+                scope_val = (row.get(uc_col, "") or "").strip()
+                owner = row.get("SF Owner", "").strip()
+                if not arm and not siemens:
+                    continue
+                key = _key(arm, siemens)
+                if key not in registry:
+                    registry[key] = Feature(
+                        prefix=_extract_prefix(siemens),
+                        arm_name=arm,
+                        siemens_name=siemens,
+                        definition=definition,
+                        uc0_scope="", uc1_scope="", uc2_scope="",
+                        sf_owner=owner,
+                    )
+                else:
+                    if not registry[key].definition and definition:
+                        registry[key].definition = definition
+                    if not registry[key].sf_owner and owner:
+                        registry[key].sf_owner = owner
+                setattr(registry[key], uc_attr, scope_val)
+
+    _parse(CSV_UC0, "UC-00", "uc0_scope")
+    _parse(CSV_UC1, "UC-01 SOLSYS E2E Quote", "uc1_scope")
+    _parse(CSV_UC2, "UC-02 SNGX Technician", "uc2_scope")
+    return registry
+
+
+def match_folders_to_features(registry: dict[str, Feature]) -> list[Path]:
+    """Match TRANSCRIPTS_PATH subdirs to features by numeric prefix. Returns unmatched folders."""
+    unmatched: list[Path] = []
+    for folder in sorted(TRANSCRIPTS_PATH.iterdir()):
+        if not folder.is_dir():
+            continue
+        prefix = _extract_prefix(folder.name)
+        if prefix and prefix in registry:
+            registry[prefix].folder = folder
+        elif prefix:
+            matched = False
+            for feat in registry.values():
+                if feat.prefix == prefix:
+                    feat.folder = folder
+                    matched = True
+                    break
+            if not matched:
+                unmatched.append(folder)
+        else:
+            unmatched.append(folder)
+    return unmatched
 
 # ---------------------------------------------------------------------------
 # Copilot CLI client
@@ -1002,7 +1152,7 @@ def process_bu(
     transcript_only: bool = False,
     qc_threshold: int = 0,
 ) -> None:
-    print(f"\n=== BU: {bu} ({len(vtts)} transcripts) ===")
+    print(f"  {len(vtts)} transcript(s)")
     analyses: list[str] = []
 
     if summary_only:
@@ -1038,17 +1188,579 @@ def process_bu(
         print(f"  [warn] no analyses available for {bu}, skipping summary")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# UC Pipeline — output paths
+# ===========================================================================
+
+def uc_analyzed_path(transcript: Path, feature_key: str) -> Path:
+    return FEATURES_OUT / feature_key / f"{transcript.stem} [ANALYZED].txt"
+
+
+def uc_analyzed_meta_path(transcript: Path, feature_key: str) -> Path:
+    return FEATURES_OUT / feature_key / f"{transcript.stem} [ANALYZED].meta.json"
+
+
+def uc_feature_summary_path(feature_key: str, display_name: str) -> Path:
+    safe = re.sub(r'[<>:"/\\|?*]', "-", display_name)
+    return FEATURES_OUT / feature_key / f"[FEATURE SUMMARY] {safe}.md"
+
+
+def uc_summary_path(uc: str) -> Path:
+    return OUTPUT_PATH / f"[UC SUMMARY] {uc}.md"
+
+
+def gap_report_path() -> Path:
+    return OUTPUT_PATH / "[GAP REPORT] coverage.md"
+
+
+def _feat_key(feat: Feature) -> str:
+    return feat.prefix or re.sub(r"[^a-z0-9]+", "-", feat.arm_name.lower()).strip("-")
+
+
+# ===========================================================================
+# UC Pipeline — prompts
+# ===========================================================================
+
+def _build_uc_transcript_prompt(feat: Feature, base_context: str, solution_prompt: str) -> str:
+    uc_scope = ", ".join(uc for uc in ("UC0", "UC1", "UC2") if feat.in_scope(uc)) or "TBD"
+    feature_block = (
+        f"## Analysis Focus: {feat.display_name}\n\n"
+        f"You are analyzing a transcript specifically for the **{feat.display_name}** capability.\n\n"
+        f"**Feature Definition:**\n{feat.definition or '(no definition available)'}\n\n"
+        f"**In scope for:** {uc_scope}\n\n"
+        "Extract only information relevant to this feature. Structure your output:\n\n"
+        "1. **Requirements Confirmed** — explicit functional/non-functional requirements discussed\n"
+        "2. **Decisions Made** — design or scoping decisions confirmed\n"
+        "3. **Open Items** — unresolved questions or TBD decisions\n"
+        "4. **Constraints** — technical, timeline, or org constraints\n"
+        "5. **Coverage Gaps** — things that should have been discussed but weren't\n"
+        "6. **Key Participants** — who spoke and their stated position\n"
+        "7. **Private Read** — candid assessment: confidence level, political subtext, risks\n\n"
+        f"If this transcript has no meaningful discussion of **{feat.display_name}**, "
+        "say so in one sentence and stop."
+    )
+    parts = []
+    if base_context:
+        parts.append(base_context)
+    if solution_prompt:
+        parts.append("## Global Transcript Extraction Guidance\n" + solution_prompt)
+    parts.append(feature_block)
+    return "\n\n---\n\n".join(parts)
+
+
+def _build_feature_summary_prompt(feat: Feature, analyses: list[str]) -> str:
+    uc_scope = ", ".join(uc for uc in ("UC0", "UC1", "UC2") if feat.in_scope(uc)) or "TBD"
+    bundle = "\n\n---\n\n".join(f"### Transcript Analysis {i+1}\n{a}" for i, a in enumerate(analyses))
+    return (
+        f"The following are {len(analyses)} transcript analyses for the "
+        f"**{feat.display_name}** capability (in scope: {uc_scope}).\n\n"
+        f"Feature definition:\n{feat.definition or '(no definition available)'}\n\n"
+        "Synthesize across all analyses:\n\n"
+        "1. **Confirmed Scope** — what's definitively in or out of scope\n"
+        "2. **Key Decisions** — design choices agreed\n"
+        "3. **Open Items** — questions still unresolved across all calls\n"
+        "4. **Coverage Confidence** — how well do the transcripts cover this feature? What's still dark?\n"
+        "5. **Top 3 Unknowns** — highest-priority gaps before design can proceed\n"
+        "6. **Owner / Stakeholders** — who owns this and who has strong opinions\n\n"
+        "---\n\n" + bundle
+    )
+
+
+def _build_uc_summary_prompt(uc: str, feature_summaries: list[tuple[str, str]]) -> str:
+    feature_list = "\n".join(f"- {name}" for name, _ in feature_summaries)
+    bundle = "\n\n---\n\n".join(f"### {name}\n{summary}" for name, summary in feature_summaries)
+    return (
+        f"The following are feature summaries for **{UC_NAMES[uc]}**.\n\n"
+        f"Features covered:\n{feature_list}\n\n"
+        "Synthesize across all features for this use case:\n\n"
+        "1. **UC Scope Summary** — what this UC is trying to accomplish end-to-end\n"
+        "2. **Confirmed Design Decisions** — locked choices across features\n"
+        "3. **Cross-Feature Dependencies** — where features interact or sequence matters\n"
+        "4. **Top Open Items** — highest-priority unresolved items across the UC\n"
+        "5. **Coverage Gaps** — in-scope features with weak or no transcript coverage\n"
+        "6. **Readiness Assessment** — overall confidence we understand this UC well enough to start HLD\n\n"
+        "---\n\n" + bundle
+    )
+
+
+# ===========================================================================
+# UC Pipeline — processing functions
+# ===========================================================================
+
+def _uc_is_analysis_fresh(
+    meta: dict,
+    source_sig: dict,
+    system_sig: str,
+) -> bool:
+    required = {
+        "status": "ok",
+        "source_sha256": source_sig["source_sha256"],
+        "source_size": source_sig["source_size"],
+        "source_mtime_ns": source_sig["source_mtime_ns"],
+        "model_transcript": MODEL_TRANSCRIPT,
+        "system_signature": system_sig,
+    }
+    return all(meta.get(k) == v for k, v in required.items())
+
+
+def _uc_is_qc_block_fresh(meta: dict, source_sig: dict, system_sig: str, qc_threshold: int) -> bool:
+    required = {
+        "status": "qc_blocked",
+        "source_sha256": source_sig["source_sha256"],
+        "source_size": source_sig["source_size"],
+        "source_mtime_ns": source_sig["source_mtime_ns"],
+        "model_transcript": MODEL_TRANSCRIPT,
+        "system_signature": system_sig,
+        "qc_threshold": qc_threshold,
+    }
+    return all(meta.get(k) == v for k, v in required.items())
+
+
+def uc_analyze_transcript(
+    transcript: Path,
+    feat: Feature,
+    base_context: str,
+    solution_prompt: str,
+    qc_threshold: int = 0,
+    counter: str = "",
+) -> "str | None":
+    key = _feat_key(feat)
+    out = uc_analyzed_path(transcript, key)
+    meta_out = uc_analyzed_meta_path(transcript, key)
+    source_sig = _source_signature(transcript)
+    system = _build_uc_transcript_prompt(feat, base_context, solution_prompt)
+    system_sig = _system_signature(system)
+    meta = _read_meta(meta_out)
+
+    prefix = f"    {counter} " if counter else "    "
+
+    if out.exists():
+        if meta and _uc_is_analysis_fresh(meta, source_sig, system_sig):
+            print(f"{prefix}[skip] {transcript.name} — already analyzed")
+            return out.read_text(encoding="utf-8")
+        print(f"{prefix}[reprocess] {transcript.name} — source/prompt/model changed")
+    elif meta and qc_threshold > 0 and _uc_is_qc_block_fresh(meta, source_sig, system_sig, qc_threshold):
+        print(f"{prefix}[skip] {transcript.name} — blocked by QC threshold ({qc_threshold})")
+        return None
+
+    print(f"{prefix}[analyze] {transcript.name} ...", end=" ", flush=True)
+    try:
+        text = transcript_to_text(transcript)
+        metrics = _quality_metrics(text)
+        qc_score, qc_label, qc_flags = _quality_assessment(metrics)
+
+        if qc_threshold > 0 and qc_score < qc_threshold:
+            print(f"SKIP (qc {qc_score} < {qc_threshold})")
+            _write_meta(meta_out, {
+                **source_sig,
+                "status": "qc_blocked",
+                "reason": "transcript quality below threshold",
+                "qc_threshold": qc_threshold,
+                "qc_score": qc_score,
+                "qc_label": qc_label,
+                "qc_flags": qc_flags,
+                "text_chars": len(text),
+                "model_transcript": MODEL_TRANSCRIPT,
+                "system_signature": system_sig,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+            })
+            return None
+
+        if len(text) < 100:
+            print("SKIP (too short)")
+            _write_meta(meta_out, {
+                **source_sig,
+                "status": "too_short",
+                "reason": "parsed transcript shorter than 100 characters",
+                "qc_threshold": qc_threshold,
+                "qc_score": qc_score,
+                "qc_label": qc_label,
+                "qc_flags": qc_flags,
+                "text_chars": len(text),
+                "model_transcript": MODEL_TRANSCRIPT,
+                "system_signature": system_sig,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+            })
+            return None
+
+        result = call_model_with_source(
+            system=system,
+            instruction=(
+                f"Analyze this transcript for the {feat.display_name} capability. "
+                f"Transcript filename: {transcript.name}"
+            ),
+            source_text=text,
+            model=MODEL_TRANSCRIPT,
+        )
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(result, encoding="utf-8")
+        _write_meta(meta_out, {
+            **source_sig,
+            "status": "ok",
+            "qc_threshold": qc_threshold,
+            "qc_score": qc_score,
+            "qc_label": qc_label,
+            "qc_flags": qc_flags,
+            "text_chars": len(text),
+            "result_chars": len(result),
+            "model_transcript": MODEL_TRANSCRIPT,
+            "system_signature": system_sig,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+        })
+        print("done")
+        time.sleep(RATE_LIMIT_SLEEP)
+        return result
+    except TimeoutError as e:
+        print(f"TIMEOUT: {e}", file=sys.stderr)
+        _write_meta(meta_out, {
+            **source_sig,
+            "status": "timeout",
+            "error": str(e),
+            "qc_threshold": qc_threshold,
+            "model_transcript": MODEL_TRANSCRIPT,
+            "system_signature": system_sig,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+        })
+        log_needs_followup(key, transcript.name, f"TIMEOUT: {e}")
+        return None
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        _write_meta(meta_out, {
+            **source_sig,
+            "status": "error",
+            "error": str(e),
+            "qc_threshold": qc_threshold,
+            "model_transcript": MODEL_TRANSCRIPT,
+            "system_signature": system_sig,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+        })
+        log_needs_followup(key, transcript.name, f"ERROR: {e}")
+        return None
+
+
+def uc_summarize_feature(
+    feat: Feature,
+    analyses: list[str],
+    base_context: str,
+    feat_num: int,
+    feat_total: int,
+) -> "str | None":
+    key = _feat_key(feat)
+    out = uc_feature_summary_path(key, feat.display_name)
+    counter = f"[{feat_num}/{feat_total}]"
+
+    if out.exists():
+        print(f"  {counter} [skip summary] {feat.display_name}")
+        return out.read_text(encoding="utf-8")
+
+    print(f"  {counter} [feature summary] {feat.display_name} ({len(analyses)} analyses) ...", end=" ", flush=True)
+    try:
+        result = call_model_with_source(
+            system=base_context or "You are an expert Salesforce Revenue Cloud architect.",
+            instruction=_build_feature_summary_prompt(feat, analyses),
+            source_text="\n\n---\n\n".join(analyses),
+            model=MODEL_SUMMARY,
+        )
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(result, encoding="utf-8")
+        print("done")
+        time.sleep(RATE_LIMIT_SLEEP)
+        return result
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return None
+
+
+def uc_summarize_uc(uc: str, feature_summaries: list[tuple[str, str]], base_context: str) -> None:
+    out = uc_summary_path(uc)
+    if out.exists():
+        print(f"  [skip] {uc} summary already exists — delete to regenerate")
+        return
+
+    print(f"  [UC summary] {uc} ({len(feature_summaries)} features) ...", end=" ", flush=True)
+    if not feature_summaries:
+        print("SKIP (no feature summaries)")
+        return
+    try:
+        result = call_model_with_source(
+            system=base_context or "You are an expert Salesforce Revenue Cloud architect.",
+            instruction=_build_uc_summary_prompt(uc, feature_summaries),
+            source_text="\n\n---\n\n".join(s for _, s in feature_summaries),
+            model=MODEL_SUMMARY,
+        )
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(result, encoding="utf-8")
+        print("done")
+        time.sleep(RATE_LIMIT_SLEEP)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+
+
+# ===========================================================================
+# UC Pipeline — gap report (no API calls)
+# ===========================================================================
+
+def generate_gap_report(registry: dict[str, Feature], unmatched_folders: list[Path]) -> None:
+    out = gap_report_path()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    features = list(registry.values())
+    with_folder = [f for f in features if f.folder is not None]
+    without_folder = [f for f in features if f.folder is None]
+
+    def transcript_count(feat: Feature) -> int:
+        if feat.folder is None:
+            return 0
+        return sum(1 for p in feat.folder.iterdir()
+                   if p.is_file() and p.suffix.lower() in (".vtt", ".txt"))
+
+    def analysis_count(feat: Feature) -> int:
+        d = FEATURES_OUT / _feat_key(feat)
+        if not d.exists():
+            return 0
+        return sum(1 for p in d.iterdir() if "[ANALYZED]" in p.name and p.suffix == ".txt")
+
+    lines: list[str] = [
+        "# Coverage Gap Report\n",
+        f"Generated: {datetime.now(UTC).isoformat()}  ",
+        f"Total features in backlog: **{len(features)}**  ",
+        f"Features with transcript folders: **{len(with_folder)}**  ",
+        f"Features without transcript folders: **{len(without_folder)}**\n",
+        "## Coverage Matrix\n",
+        "| Feature | ARM Capability | UC0 | UC1 | UC2 | Transcripts | Analyzed |",
+        "|---------|---------------|-----|-----|-----|-------------|----------|",
+    ]
+
+    for feat in sorted(features, key=lambda f: (f.prefix or "z", f.arm_name)):
+        tc = transcript_count(feat)
+        ac = analysis_count(feat)
+        status = f"{ac}/{tc}" if tc else "**NO COVERAGE**"
+        lines.append(
+            f"| {feat.prefix or '-'} "
+            f"| {feat.arm_name} "
+            f"| {feat.scope_label('UC0')} "
+            f"| {feat.scope_label('UC1')} "
+            f"| {feat.scope_label('UC2')} "
+            f"| {tc} "
+            f"| {status} |"
+        )
+
+    # Priority gaps: in-scope for at least one UC, no transcripts
+    in_scope_no_coverage = [
+        f for f in without_folder
+        if any(f.in_scope(uc) for uc in ("UC0", "UC1", "UC2"))
+    ]
+
+    lines.append("\n## Priority Gaps (in-scope, no recordings)\n")
+    if in_scope_no_coverage:
+        for feat in sorted(in_scope_no_coverage, key=lambda f: (f.prefix or "z")):
+            ucs = [uc for uc in ("UC0", "UC1", "UC2") if feat.in_scope(uc)]
+            lines.append(f"- **{feat.display_name}** — in scope for {', '.join(ucs)}")
+            if feat.definition:
+                first_sentence = feat.definition.split(".")[0].strip()
+                lines.append(f"  _{first_sentence}_")
+    else:
+        lines.append("_All in-scope features have at least one transcript folder._")
+
+    if unmatched_folders:
+        lines.append("\n## Unmatched Folders (not in backlog CSVs)\n")
+        lines.append("These folders were found but could not be matched to a backlog feature:\n")
+        for p in unmatched_folders:
+            lines.append(f"- `{p.name}`")
+
+    not_in_scope = [f for f in features if not any(f.in_scope(uc) for uc in ("UC0", "UC1", "UC2"))]
+    if not_in_scope:
+        lines.append("\n## Out-of-Scope Features (no UC coverage required)\n")
+        for feat in sorted(not_in_scope, key=lambda f: f.prefix or "z"):
+            lines.append(f"- {feat.prefix or '-'} {feat.arm_name}")
+
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  [gap report] written -> {out}")
+
+
+# ===========================================================================
+# UC Pipeline — main entry point
+# ===========================================================================
+
+def _find_transcripts(folder: Path) -> list[Path]:
+    return sorted(p for p in folder.iterdir()
+                  if p.is_file() and p.suffix.lower() in (".vtt", ".txt"))
+
+
+def run_uc_pipeline(
+    summary_only: bool = False,
+    gap_only: bool = False,
+    qc_only: bool = False,
+    feature_filter: "str | None" = None,
+    qc_threshold: int = 0,
+) -> None:
+    setup_run_logging()
+
+    if not TRANSCRIPTS_PATH_RAW:
+        sys.exit("TRANSCRIPTS_PATH is missing. Set it in .env")
+    if not TRANSCRIPTS_PATH.exists():
+        sys.exit(f"TRANSCRIPTS_PATH not found: {TRANSCRIPTS_PATH}")
+
+    OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+    FEATURES_OUT.mkdir(parents=True, exist_ok=True)
+
+    missing_csvs = [p for p in required_csv_paths() if not p.exists()]
+    if missing_csvs and not qc_only:
+        sys.exit(
+            "Required backlog CSV files are missing. Place them under client_data/.\n"
+            "Missing:\n" + "\n".join(f"- {p}" for p in missing_csvs)
+        )
+
+    print("Loading feature registry from backlog CSVs...")
+    registry = load_feature_registry() if not missing_csvs else {}
+    if registry:
+        print(f"  {len(registry)} features loaded")
+
+    print("Matching transcript folders to features...")
+    unmatched = match_folders_to_features(registry) if registry else []
+    matched = sum(1 for f in registry.values() if f.folder is not None)
+    if registry:
+        print(f"  {matched} features matched to folders, {len(unmatched)} unmatched folders")
+        if unmatched:
+            print(f"  Unmatched folders: {[p.name for p in unmatched]}")
+
+    # Count total transcripts and MP4s for the user
+    all_vtts = list(TRANSCRIPTS_PATH.rglob("*.vtt")) + list(TRANSCRIPTS_PATH.rglob("*.txt"))
+    all_mp4s = list(TRANSCRIPTS_PATH.rglob("*.mp4"))
+    print(f"\n  Transcripts found  : {len(all_vtts)}")
+    if all_mp4s:
+        print(f"  Video files found  : {len(all_mp4s)}  (run transcribe_batch.py to convert)")
+
+    if gap_only:
+        print("\n=== Generating gap report ===")
+        generate_gap_report(registry, unmatched)
+        return
+
+    if qc_only:
+        bus_for_qc = {folder.name: _find_transcripts(folder)
+                      for folder in TRANSCRIPTS_PATH.iterdir() if folder.is_dir()}
+        generate_qc_report(bus_for_qc)
+        return
+
+    base_context = build_system_prompt("")  # loads brief + rolodex
+    solution_prompt = load_solution_prompt()
+
+    if feature_filter:
+        feat = registry.get(feature_filter)
+        if not feat:
+            sys.exit(f"Feature '{feature_filter}' not found. Available: {sorted(registry)}")
+        if feat.folder is None:
+            sys.exit(f"Feature '{feature_filter}' has no matched transcript folder.")
+        transcripts = _find_transcripts(feat.folder)
+        analyses: list[str] = []
+        if not summary_only:
+            for i, t in enumerate(transcripts, 1):
+                result = uc_analyze_transcript(
+                    t, feat, base_context, solution_prompt, qc_threshold,
+                    counter=f"[{i}/{len(transcripts)}]",
+                )
+                if result:
+                    analyses.append(result)
+        else:
+            key = _feat_key(feat)
+            for p in sorted((FEATURES_OUT / key).iterdir()):
+                if "[ANALYZED]" in p.name and p.suffix == ".txt":
+                    analyses.append(p.read_text(encoding="utf-8"))
+        if analyses:
+            uc_summarize_feature(feat, analyses, base_context, 1, 1)
+        print("\n=== Generating gap report ===")
+        generate_gap_report(registry, unmatched)
+        return
+
+    # Full pipeline: all features → UC rollups → gap report
+    features_with_folders = [
+        (key, feat) for key, feat in sorted(registry.items(), key=lambda kv: (kv[1].prefix or "z", kv[1].arm_name))
+        if feat.folder is not None
+    ]
+    feat_total = len(features_with_folders)
+    print(f"\n=== Analyzing transcripts across {feat_total} features ===")
+
+    feature_summaries_by_uc: dict[str, list[tuple[str, str]]] = {uc: [] for uc in UC_NAMES}
+
+    for feat_num, (key, feat) in enumerate(features_with_folders, 1):
+        transcripts = _find_transcripts(feat.folder)
+        feat_counter = f"[{feat_num}/{feat_total}]"
+        print(f"\n  {feat_counter} Feature: {feat.display_name} — {len(transcripts)} transcript(s)")
+
+        analyses = []
+        if summary_only:
+            for p in sorted((FEATURES_OUT / key).iterdir()):
+                if "[ANALYZED]" in p.name and p.suffix == ".txt":
+                    analyses.append(p.read_text(encoding="utf-8"))
+            if not analyses:
+                print(f"    [warn] no existing analyses found for {feat.display_name}")
+        else:
+            for i, t in enumerate(transcripts, 1):
+                result = uc_analyze_transcript(
+                    t, feat, base_context, solution_prompt, qc_threshold,
+                    counter=f"[{i}/{len(transcripts)}]",
+                )
+                if result:
+                    analyses.append(result)
+
+        if analyses:
+            summary = uc_summarize_feature(feat, analyses, base_context, feat_num, feat_total)
+            if summary:
+                for uc in UC_NAMES:
+                    if feat.in_scope(uc):
+                        feature_summaries_by_uc[uc].append((feat.display_name, summary))
+
+    if unmatched:
+        print(f"\n=== Processing {len(unmatched)} unmatched folders ===")
+        for i, folder in enumerate(unmatched, 1):
+            synthetic = Feature(
+                prefix="", arm_name=folder.name, siemens_name=folder.name,
+                definition="No backlog feature mapping. Extract requirements, decisions, and open items.",
+                uc0_scope="", uc1_scope="", uc2_scope="", sf_owner="", folder=folder,
+            )
+            transcripts = _find_transcripts(folder)
+            print(f"\n  [{i}/{len(unmatched)}] Unmatched: {folder.name} — {len(transcripts)} transcript(s)")
+            analyses = []
+            if not summary_only:
+                for j, t in enumerate(transcripts, 1):
+                    result = uc_analyze_transcript(
+                        t, synthetic, base_context, solution_prompt, qc_threshold,
+                        counter=f"[{j}/{len(transcripts)}]",
+                    )
+                    if result:
+                        analyses.append(result)
+            if analyses:
+                uc_summarize_feature(synthetic, analyses, base_context, i, len(unmatched))
+
+    print("\n=== Generating UC summaries ===")
+    for uc, summaries in feature_summaries_by_uc.items():
+        if summaries:
+            uc_summarize_uc(uc, summaries, base_context)
+        else:
+            print(f"  [skip] {uc} — no feature summaries available")
+
+    print("\n=== Generating gap report ===")
+    generate_gap_report(registry, unmatched)
+
+    print("\nAll done.")
+
+
+# ===========================================================================
+# BU Pipeline main()
+# ===========================================================================
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze Siemens transcripts by BU using GitHub Copilot CLI")
-    parser.add_argument("--bu", help="Process only this BU subfolder name")
+    parser.add_argument("--uc", action="store_true",
+                        help="Run the UC pipeline (maps folders to backlog features, produces gap report)")
+    parser.add_argument("--bu", help="BU pipeline: process only this BU subfolder name")
+    parser.add_argument("--feature", help="UC pipeline: process only this feature (e.g. '1.04')")
     parser.add_argument("--summary-only", action="store_true",
-                        help="Skip transcript analysis; re-run BU summaries from existing [ANALYZED] files")
+                        help="Skip transcript analysis; re-run summaries from existing [ANALYZED] files")
     parser.add_argument("--transcript-only", action="store_true",
                         help="Analyze each transcript and write [ANALYZED] files without generating BU summaries")
+    parser.add_argument("--gap-only", action="store_true",
+                        help="UC pipeline only: regenerate gap report without any API calls")
     parser.add_argument("--qc-only", action="store_true",
                         help="Only generate transcript quality report (no API calls)")
     parser.add_argument("--qc-threshold", type=int, default=QC_THRESHOLD_DEFAULT,
@@ -1060,6 +1772,18 @@ def main() -> None:
     if args.qc_threshold < 0 or args.qc_threshold > 100:
         sys.exit("--qc-threshold must be between 0 and 100")
 
+    # Route to UC pipeline when --uc is set
+    if args.uc or args.gap_only or args.feature:
+        run_uc_pipeline(
+            summary_only=args.summary_only,
+            gap_only=args.gap_only,
+            qc_only=args.qc_only,
+            feature_filter=args.feature,
+            qc_threshold=args.qc_threshold,
+        )
+        return
+
+    # BU pipeline
     setup_run_logging()
 
     if not TRANSCRIPTS_PATH_RAW:
@@ -1106,8 +1830,11 @@ def main() -> None:
             qc_threshold=args.qc_threshold,
         )
     else:
+        bu_names = sorted(bus)
+        bu_total = len(bu_names)
         _progress["total"] = total_transcripts
-        for bu_name in sorted(bus):
+        for i, bu_name in enumerate(bu_names, 1):
+            print(f"\n[{i}/{bu_total}] BU: {bu_name}")
             try:
                 process_bu(
                     bu_name,
@@ -1118,8 +1845,6 @@ def main() -> None:
                     qc_threshold=args.qc_threshold,
                 )
             except Exception as e:
-                # A hard failure in one BU (e.g. an unexpected I/O error)
-                # should not prevent the remaining BUs from being processed.
                 print(f"\n[ERROR] BU '{bu_name}' failed unexpectedly: {e}", file=sys.stderr)
                 log_needs_followup(bu_name, "[BU]", f"UNEXPECTED BU ERROR: {e}")
 
