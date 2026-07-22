@@ -59,7 +59,7 @@ def _plain_fail(text: str) -> None:
 # Step implementations
 # ---------------------------------------------------------------------------
 
-TOTAL_STEPS = 8
+TOTAL_STEPS = 9
 
 
 def step_python_version(console=None) -> bool:
@@ -232,8 +232,8 @@ def step_copilot_auth(console=None) -> bool:
 
 def step_transcripts_folder(console=None) -> str | None:
     prompt_text = (
-        "\n  Enter the full path to the folder containing your transcript files\n"
-        "  (.vtt, .txt, or .mp4 recordings):\n  > "
+        "\n  Enter the full path to the folder where transcript files (.vtt, .txt) are stored\n"
+        "  (or will be written after transcription):\n  > "
     )
     while True:
         raw = input(prompt_text).strip().strip('"').strip("'")
@@ -243,31 +243,93 @@ def step_transcripts_folder(console=None) -> str | None:
         p = Path(raw)
         if not p.exists():
             print(f"  Folder not found: {p}")
-            answer = input("  Try again? (Y/n): ").strip().lower()
+            answer = input("  Create it? (Y/n): ").strip().lower()
             if answer == "n":
-                return None
-            continue
+                answer2 = input("  Try a different path? (Y/n): ").strip().lower()
+                if answer2 == "n":
+                    return None
+                continue
+            p.mkdir(parents=True, exist_ok=True)
 
-        exts = {".vtt", ".txt", ".mp4"}
+        exts = {".vtt", ".txt"}
         found = [f for f in p.rglob("*") if f.suffix.lower() in exts and f.is_file()]
         count = len(found)
         if count == 0:
-            warn = "  No .vtt, .txt, or .mp4 files found in that folder."
+            note = "  No .vtt or .txt files found yet — that's fine if transcription hasn't run."
             if console:
-                console.print(warn, style="yellow")
+                console.print(note, style="yellow")
             else:
-                _plain_warn(warn)
-            answer = input("  Use this folder anyway? (Y/n): ").strip().lower()
-            if answer == "n":
-                continue
+                print(note)
         else:
-            ok_msg = f"  Found {count} transcript/recording file(s)."
+            ok_msg = f"  Found {count} transcript file(s)."
             if console:
                 console.print(ok_msg, style="green")
             else:
                 _plain_ok(ok_msg)
 
         return str(p)
+
+
+def step_recordings_folder(console=None) -> tuple[str | None, str | None]:
+    """Ask whether MP4s are in a separate folder (e.g. OneDrive). Returns (recordings_path, staging_path)."""
+    intro = (
+        "\n  Are your MP4 recordings stored in a separate folder from your transcripts?\n"
+        "  (e.g. a OneDrive/SharePoint-synced Recordings folder on a low-disk VM)\n"
+        "  If yes, files will be copied one at a time to a staging folder, transcribed,\n"
+        "  then deleted — so only ~1 GB of local disk is needed at a time."
+    )
+    if console:
+        console.print(intro)
+    else:
+        print(intro)
+
+    answer = input("\n  Separate recordings folder? (y/N): ").strip().lower()
+    if answer != "y":
+        return None, None
+
+    prompt_text = "\n  Path to the recordings folder (OneDrive/SharePoint sync):\n  > "
+    recordings_path = None
+    while True:
+        raw = input(prompt_text).strip().strip('"').strip("'")
+        if not raw:
+            print("  Path cannot be empty.")
+            continue
+        p = Path(raw)
+        if not p.exists():
+            print(f"  Folder not found: {p}")
+            answer2 = input("  Try again? (Y/n): ").strip().lower()
+            if answer2 == "n":
+                return None, None
+            continue
+        mp4s = list(p.rglob("*.mp4"))
+        if mp4s:
+            ok_msg = f"  Found {len(mp4s)} MP4 file(s)."
+            if console:
+                console.print(ok_msg, style="green")
+            else:
+                _plain_ok(ok_msg)
+        else:
+            note = "  No MP4 files found yet — that's fine if they haven't synced."
+            if console:
+                console.print(note, style="yellow")
+            else:
+                print(note)
+        recordings_path = str(p)
+        break
+
+    default_staging = str(_HERE / "staging")
+    raw = input(
+        f"\n  Local staging folder (press Enter for default):\n  [{default_staging}]\n  > "
+    ).strip().strip('"').strip("'")
+    staging_path = raw if raw else default_staging
+    Path(staging_path).mkdir(parents=True, exist_ok=True)
+    ok_msg = f"  Staging folder: {staging_path}"
+    if console:
+        console.print(ok_msg, style="green")
+    else:
+        _plain_ok(ok_msg)
+
+    return recordings_path, staging_path
 
 
 def step_output_folder(transcripts_path: str, console=None) -> str:
@@ -321,7 +383,12 @@ def step_context_files(console=None) -> dict[str, bool]:
     return status
 
 
-def write_env(transcripts_path: str, output_path: str) -> None:
+def write_env(
+    transcripts_path: str,
+    output_path: str,
+    recordings_path: str | None = None,
+    staging_path: str | None = None,
+) -> None:
     lines = []
 
     if ENV_EXAMPLE.exists():
@@ -332,6 +399,16 @@ def write_env(transcripts_path: str, output_path: str) -> None:
                 lines.append(f"TRANSCRIPTS_PATH={transcripts_path}")
             elif stripped.startswith("OUTPUT_PATH=") or stripped.startswith("# OUTPUT_PATH="):
                 lines.append(f"OUTPUT_PATH={output_path}")
+            elif stripped.startswith("# RECORDINGS_PATH="):
+                if recordings_path:
+                    lines.append(f"RECORDINGS_PATH={recordings_path}")
+                else:
+                    lines.append(line)
+            elif stripped.startswith("# STAGING_PATH="):
+                if staging_path:
+                    lines.append(f"STAGING_PATH={staging_path}")
+                else:
+                    lines.append(line)
             else:
                 lines.append(line)
     else:
@@ -340,6 +417,10 @@ def write_env(transcripts_path: str, output_path: str) -> None:
             f"TRANSCRIPTS_PATH={transcripts_path}",
             f"OUTPUT_PATH={output_path}",
         ]
+        if recordings_path:
+            lines.append(f"RECORDINGS_PATH={recordings_path}")
+        if staging_path:
+            lines.append(f"STAGING_PATH={staging_path}")
 
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -426,19 +507,25 @@ def run_wizard(reset: bool = False) -> bool:
         print("\n  Setup cancelled — no transcripts folder selected.")
         return False
 
-    # Step 7: Output folder
-    step_label(7, "Output folder")
+    # Step 7: Recordings folder (optional — OneDrive/low-disk scenario)
+    step_label(7, "Recordings folder (MP4 source)")
+    recordings_path, staging_path = step_recordings_folder(console)
+
+    # Step 8: Output folder
+    step_label(8, "Output folder")
     output_path = step_output_folder(transcripts_path, console)
 
-    # Step 8: Context files
-    step_label(8, "Optional context files")
+    # Step 9: Context files
+    step_label(9, "Optional context files")
     context_status = step_context_files(console)
 
     # Write config
-    write_env(transcripts_path, output_path)
+    write_env(transcripts_path, output_path, recordings_path, staging_path)
     write_setup_marker({
         "transcripts_path": transcripts_path,
         "output_path": output_path,
+        "recordings_path": recordings_path,
+        "staging_path": staging_path,
         "ffmpeg_available": ffmpeg_ok,
         "copilot_auth_ok": auth_ok,
         "context_files": context_status,
