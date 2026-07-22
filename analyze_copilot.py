@@ -58,6 +58,24 @@ QC_THRESHOLD_DEFAULT = int(os.environ.get("QC_THRESHOLD", "0"))
 # gets logged to NEEDS_FOLLOWUP.txt and skipped so the run keeps moving.
 COPILOT_TIMEOUT_SECONDS = int(os.environ.get("COPILOT_TIMEOUT_SECONDS", "900"))
 
+# How often to print a "still working" heartbeat while waiting on a single
+# Copilot CLI call. A non-technical user watching a plain terminal (no
+# progress bar, possibly no VS Code) has no way to tell a slow-but-normal
+# call apart from a silent hang unless something is printed periodically.
+HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS", "30"))
+
+# Simple overall progress counter (e.g. "[12/75]") shown next to each
+# transcript line so a non-technical user can see the run is actually
+# advancing through a long batch, not just individual per-file activity.
+_progress = {"current": 0, "total": 0}
+
+
+def _progress_tag() -> str:
+    if not _progress["total"]:
+        return ""
+    _progress["current"] += 1
+    return f"[{_progress['current']}/{_progress['total']}] "
+
 # ---------------------------------------------------------------------------
 # Long-path-safe file I/O
 #
@@ -174,15 +192,33 @@ def _run_copilot(
             try:
                 with open(stdout_path, "w", encoding="utf-8") as stdout_f, \
                      open(stderr_path, "w", encoding="utf-8") as stderr_f:
-                    proc = subprocess.run(
+                    proc = subprocess.Popen(
                         cmd,
-                        check=True,
                         stdout=stdout_f,
                         stderr=stderr_f,
                         text=True,
-                        timeout=COPILOT_TIMEOUT_SECONDS,
                     )
-                    del proc
+                    started = time.monotonic()
+                    next_heartbeat = started + HEARTBEAT_SECONDS
+                    returncode = None
+                    while True:
+                        try:
+                            returncode = proc.wait(timeout=1)
+                            break
+                        except subprocess.TimeoutExpired:
+                            now = time.monotonic()
+                            elapsed = now - started
+                            if elapsed >= COPILOT_TIMEOUT_SECONDS:
+                                proc.kill()
+                                proc.wait(timeout=10)
+                                raise TimeoutError(
+                                    f"Copilot CLI call exceeded {COPILOT_TIMEOUT_SECONDS}s timeout"
+                                )
+                            if now >= next_heartbeat:
+                                print(f"\n    [still working ... {int(elapsed)}s elapsed]", end=" ", flush=True)
+                                next_heartbeat = now + HEARTBEAT_SECONDS
+                    if returncode != 0:
+                        raise subprocess.CalledProcessError(returncode, cmd)
             except FileNotFoundError as exc:
                 last_exc = exc
                 if attempt < max_attempts:
@@ -193,14 +229,12 @@ def _run_copilot(
                 raise RuntimeError(
                     "GitHub Copilot CLI is not available. Install it and ensure 'copilot --version' works in this shell."
                 ) from exc
-            except subprocess.TimeoutExpired as exc:
+            except TimeoutError:
                 # A single call that never returns should not stall the whole
                 # batch. Don't retry (a hang is unlikely to resolve itself);
                 # surface a clear, distinguishable error so callers can log
                 # this file for follow-up and move on to the next one.
-                raise TimeoutError(
-                    f"Copilot CLI call exceeded {COPILOT_TIMEOUT_SECONDS}s timeout"
-                ) from exc
+                raise
             except subprocess.CalledProcessError as exc:
                 stderr = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
                 stdout = stdout_path.read_text(encoding="utf-8", errors="replace").strip()
@@ -216,6 +250,61 @@ def _run_copilot(
 
     # Unreachable, but keeps type-checkers happy.
     raise RuntimeError("Copilot CLI request failed after retries.") from last_exc
+
+
+def preflight_check() -> str | None:
+    """Verify the Copilot CLI is installed, authenticated, and responsive
+    before committing to a real batch run (which can take hours). Returns
+    None on success, or a plain-English error message describing exactly
+    what's wrong and how to fix it.
+
+    This exists because a systemic failure (wrong GitHub account signed in,
+    Copilot CLI not installed, no network) previously showed no clear signal
+    to a non-technical user watching the terminal — the batch would either
+    hang until each of 75 files individually timed out, or (worse) `run.py`
+    would report "Run complete" with a failure count of 0 because nothing
+    ever got the chance to log a per-file failure.
+    """
+    print("[preflight] checking Copilot CLI is installed and authenticated ...", end=" ", flush=True)
+    try:
+        reply = _run_copilot(
+            "Reply with exactly the word: OK",
+            model="auto",
+        )
+    except TimeoutError:
+        print("FAILED")
+        return (
+            "The GitHub Copilot CLI did not respond within the timeout.\n"
+            "This usually means it's stuck or unreachable (e.g. network issue).\n"
+            "Try running 'copilot --version' in a terminal to confirm it works, then try again."
+        )
+    except RuntimeError as e:
+        print("FAILED")
+        return (
+            f"The GitHub Copilot CLI check failed:\n  {e}\n\n"
+            "Common causes:\n"
+            "  - Not signed in, or signed in with the wrong GitHub account\n"
+            "    (run 'gh auth status' to check, 'gh auth switch' to change accounts)\n"
+            "  - The Copilot CLI isn't installed\n"
+            "    (run 'copilot --version' to confirm it's on PATH)\n"
+            "  - No network connection\n"
+        )
+    except Exception as e:  # noqa: BLE001 - deliberately broad: this is a safety gate
+        print("FAILED")
+        return f"Unexpected error while checking the Copilot CLI: {e}"
+
+    if "OK" not in reply.upper():
+        print("WARNING")
+        # Not a hard failure — the CLI responded, just not with what we
+        # expected. Could be a model quirk. Let the run proceed but flag it.
+        print(
+            f"[preflight] Copilot CLI responded, but not as expected (got: {reply[:80]!r}). "
+            "Continuing anyway — if the real run also looks wrong, check 'gh auth status'."
+        )
+        return None
+
+    print("OK")
+    return None
 
 
 def call_model(
@@ -778,6 +867,7 @@ def _try_record_failure(
 
 
 def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -> str | None:
+    tag = _progress_tag()
     out = analyzed_path(vtt, bu)
     meta_out = analyzed_meta_path(vtt, bu)
     source_sig = _source_signature(vtt)
@@ -785,14 +875,14 @@ def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -
     meta = _read_meta(meta_out)
     if out.exists():
         if meta and _is_analysis_fresh(meta, source_sig, system_sig):
-            print(f"  [skip] {vtt.name} — already analyzed (fresh cache)")
+            print(f"  {tag}[skip] {vtt.name} — already analyzed (fresh cache)")
             return _safe_read_text(out, encoding="utf-8")
-        print(f"  [reprocess] {vtt.name} — source/prompt/model changed or legacy cache")
+        print(f"  {tag}[reprocess] {vtt.name} — source/prompt/model changed or legacy cache")
     elif meta and qc_threshold > 0 and _is_qc_block_fresh(meta, source_sig, system_sig, qc_threshold):
-        print(f"  [skip] {vtt.name} — blocked by QC threshold ({qc_threshold})")
+        print(f"  {tag}[skip] {vtt.name} — blocked by QC threshold ({qc_threshold})")
         return None
 
-    print(f"  [analyze] {vtt.name} ...", end=" ", flush=True)
+    print(f"  {tag}[analyze] {vtt.name} ...", end=" ", flush=True)
     try:
         text = transcript_to_text(vtt)
         metrics = _quality_metrics(text)
@@ -963,6 +1053,8 @@ def main() -> None:
                         help="Only generate transcript quality report (no API calls)")
     parser.add_argument("--qc-threshold", type=int, default=QC_THRESHOLD_DEFAULT,
                         help="Minimum QC score required before transcript analysis runs; 0 disables gating")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip the startup Copilot CLI connectivity/auth check (not recommended)")
     args = parser.parse_args()
 
     if args.qc_threshold < 0 or args.qc_threshold > 100:
@@ -989,11 +1081,22 @@ def main() -> None:
         generate_qc_report(bus)
         return
 
-    print(f"Found {sum(len(v) for v in bus.values())} transcripts across {len(bus)} BUs: {', '.join(sorted(bus))}")
+    if not args.skip_preflight:
+        error = preflight_check()
+        if error:
+            sys.exit(
+                "\n[FATAL] Cannot start the analysis run:\n\n"
+                f"{error}\n\n"
+                "Nothing has been processed yet — it's safe to fix this and re-run."
+            )
+
+    total_transcripts = sum(len(v) for v in bus.values())
+    print(f"Found {total_transcripts} transcripts across {len(bus)} BUs: {', '.join(sorted(bus))}")
 
     if args.bu:
         if args.bu not in bus:
             sys.exit(f"BU '{args.bu}' not found. Available: {', '.join(sorted(bus))}")
+        _progress["total"] = len(bus[args.bu])
         process_bu(
             args.bu,
             bus[args.bu],
@@ -1003,6 +1106,7 @@ def main() -> None:
             qc_threshold=args.qc_threshold,
         )
     else:
+        _progress["total"] = total_transcripts
         for bu_name in sorted(bus):
             try:
                 process_bu(

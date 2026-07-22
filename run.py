@@ -434,6 +434,29 @@ def _run_script(args_list: list[str]) -> int:
     return result.returncode
 
 
+def _run_script_or_die(args_list: list[str], phase_label: str) -> None:
+    """Run analyze_copilot.py and stop the whole run.py process immediately
+    if it fails, instead of silently continuing to the next phase and
+    printing a "Run complete" report that would misrepresent what actually
+    happened. A non-technical user needs an unmissable, plain-English signal
+    here — not a status table that looks fine because nothing had the
+    chance to log a per-file failure."""
+    returncode = _run_script(args_list)
+    if returncode != 0:
+        _print(
+            f"\n[bold red]STOPPED: the '{phase_label}' step failed (exit code {returncode}).[/bold red]"
+            if console else
+            f"\nSTOPPED: the '{phase_label}' step failed (exit code {returncode})."
+        )
+        _print(
+            "Nothing further will run. Scroll up for the error from analyze_copilot.py, "
+            "or check the most recent log in the output folder's 'logs' subfolder.\n"
+            "Common causes: not signed in to GitHub Copilot CLI (or signed in with the wrong "
+            "account), no network connection, or TRANSCRIPTS_PATH/OUTPUT_PATH misconfigured."
+        )
+        sys.exit(returncode)
+
+
 # ---------------------------------------------------------------------------
 # Status report
 # ---------------------------------------------------------------------------
@@ -534,7 +557,7 @@ def main() -> None:
         _print("Re-running summaries from existing analyses ...")
         before = _collect_summaries(OUTPUT_PATH)
         nf_before = _read_followup_lines()
-        _run_script(["--summary-only"])
+        _run_script_or_die(["--summary-only"], "summary regeneration")
         if not args.no_changelog:
             after = _collect_summaries(OUTPUT_PATH)
             run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
@@ -571,7 +594,7 @@ def main() -> None:
             return
         before = _collect_summaries(OUTPUT_PATH)
         nf_before = _read_followup_lines()
-        _run_script(["--summary-only"])
+        _run_script_or_die(["--summary-only"], "summary regeneration")
         if not args.no_changelog:
             after = _collect_summaries(OUTPUT_PATH)
             run_label = datetime.now(UTC).strftime("%Y-%m-%d %H%M")
@@ -592,11 +615,11 @@ def main() -> None:
 
     # Phase 1: transcript analysis
     _rule("Analyzing transcripts")
-    _run_script(["--transcript-only"])
+    _run_script_or_die(["--transcript-only"], "transcript analysis")
 
     # Phase 2: summaries
     _rule("Updating summaries")
-    _run_script(["--summary-only"])
+    _run_script_or_die(["--summary-only"], "summary generation")
 
     this_run_issues = _new_followup_lines(nf_before)
 
