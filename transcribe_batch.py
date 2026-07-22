@@ -207,11 +207,21 @@ def main() -> None:
         if staging:
             local_file = staging / file.name
             _log(log_path, f"{prefix} [copy] {file.name} -> {staging} ...")
-            try:
-                shutil.copy2(str(file), str(local_file))
-            except Exception as exc:
-                _log(log_path, f"{prefix} [error] {file.name} — copy to staging failed: {exc}")
-                _log_followup(followup_path, file.name, f"COPY ERROR: {exc}")
+            copy_ok = False
+            for attempt in range(1, 4):
+                try:
+                    shutil.copy2(str(file), str(local_file))
+                    copy_ok = True
+                    break
+                except Exception as exc:
+                    if attempt < 3:
+                        wait = 2 ** attempt
+                        _log(log_path, f"{prefix} [copy-retry {attempt}/3] {file.name} — {exc} — retrying in {wait}s ...")
+                        time.sleep(wait)
+                    else:
+                        _log(log_path, f"{prefix} [error] {file.name} — copy to staging failed after 3 attempts: {exc}")
+                        _log_followup(followup_path, file.name, f"COPY ERROR: {exc}")
+            if not copy_ok:
                 failed += 1
                 continue
 
@@ -258,6 +268,8 @@ def main() -> None:
         if staging and local_file.exists():
             local_file.unlink(missing_ok=True)
             _log(log_path, f"{prefix} [staged-cleanup] {local_file.name} removed from staging")
+            # Brief pause so OneDrive sync client settles before the next copy
+            time.sleep(2)
 
         if status == "ok":
             done += 1
