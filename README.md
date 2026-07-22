@@ -18,7 +18,7 @@ For unattended/background use (e.g. large backfills launched as a detached proce
 python run.py --yes
 ```
 
-Note: `--yes` only skips the confirmation prompts in the normal run flow. First-time setup (`--setup` / `setup_wizard.py`) is still interactive by design, since it collects your GitHub PAT and folder paths — run it once manually before automating `run.py`.
+Note: `--yes` only skips the confirmation prompts in the normal run flow. First-time setup (`--setup` / `setup_wizard.py`) is still interactive by design, since it collects your folder paths and confirms Copilot CLI auth — run it once manually before automating `run.py`.
 
 ---
 
@@ -42,7 +42,7 @@ on the Siemens Copilot-only environment.
 ## Prerequisites
 
 - Python 3.9+
-- A GitHub PAT with `models:read` scope → [github.com/settings/tokens](https://github.com/settings/tokens)
+- GitHub Copilot CLI, authenticated (`analyze_copilot.py` calls it as a subprocess — no GitHub PAT needed)
 - Transcript files (`.vtt` or `.txt`) on disk — or MP4 recordings (see `transcribe_batch.py`)
 - `ffmpeg` in PATH for transcription: `winget install Gyan.FFmpeg`
 
@@ -73,7 +73,6 @@ cp .env.example .env
 Edit the `.env`:
 
 ```
-GITHUB_TOKEN=ghp_...          # GitHub PAT with models:read scope
 TRANSCRIPTS_PATH=/path/to/transcripts
 OUTPUT_PATH=./output          # optional, defaults to ./output
 
@@ -83,6 +82,8 @@ STAGING_PATH=C:\tmp\transcript_staging   # optional, defaults to ./staging
 ```
 
 The scripts load `.env` from the project root first. The old `~/.config/client-transcript-analyzer/.env` location is only a fallback for legacy setups.
+
+Note: `GITHUB_TOKEN` is only needed if you're running the retired `archive/analyze.py` or `archive/analyze_uc.py` scripts (direct GitHub Models API). The active `analyze_copilot.py` pipeline authenticates via the Copilot CLI instead.
 
 **3. Populate `client_context/` (gitignored — copy manually)**
 
@@ -181,19 +182,19 @@ COPILOT_MODEL_SUMMARY=auto
 
 ## Rate Limits
 
-Both scripts use Claude via GitHub Models (`models.inference.ai.azure.com`). Limits on Copilot Business:
+`analyze_copilot.py` calls Claude via the GitHub Copilot CLI. Limits on Copilot Business:
 
 | Model | Used for | Limit |
 |-------|---------|-------|
 | `claude-3-5-haiku` | Per-transcript analysis | ~2,000 req/day |
 | `claude-3-5-sonnet` | Summaries | ~50 req/day |
 
-Both scripts are resume-safe — skips output files that already exist. Safe to interrupt and rerun.
+Both pipelines (BU-flat and UC) are resume-safe — skips output files that already exist. Safe to interrupt and rerun.
 
 Override models via env vars:
 ```
-MODEL_TRANSCRIPT=claude-3-5-haiku-20241022
-MODEL_SUMMARY=claude-3-5-sonnet-20241022
+COPILOT_MODEL_TRANSCRIPT=auto
+COPILOT_MODEL_SUMMARY=auto
 RATE_LIMIT_SLEEP=2
 ```
 

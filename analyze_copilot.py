@@ -631,9 +631,31 @@ def _load_file(name: str) -> str:
     return ""
 
 
+_context_warning_shown = False
+
+
 def build_system_prompt(transcript_prompt: str) -> str:
     brief = _load_file("program_brief.txt")
     rolodex = _load_file("rolodex.txt")
+
+    # Missing context files degrade quality silently (no exception, no
+    # visible symptom besides weaker output) — warn loudly once per run so
+    # a non-technical user notices before assuming a full backfill is done.
+    global _context_warning_shown
+    if not _context_warning_shown:
+        missing = []
+        if not brief:
+            missing.append("program_brief.txt")
+        if not rolodex:
+            missing.append("rolodex.txt")
+        if missing:
+            print(
+                f"[warn] client_context/ is missing: {', '.join(missing)} — "
+                "analysis will run, but quality will be noticeably worse without "
+                "this context (see client_context/README.txt for setup)."
+            )
+        _context_warning_shown = True
+
     parts = []
     if brief:
         parts.append(brief)

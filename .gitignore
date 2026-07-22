@@ -11,3 +11,4 @@ __pycache__/
 .venv/
 venv/
 full_run_std*.log
+setup_complete.json
