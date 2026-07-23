@@ -43,7 +43,7 @@ DEFAULT_PATTERN = "*.mp4"
 # Transcription worker (runs in a subprocess so it's killable on timeout)
 # ---------------------------------------------------------------------------
 
-def _transcribe_worker(source_path: str, output_dir: str, model_name: str, result_queue):
+def _transcribe_worker(source_path: str, output_dir: str, model_name: str, result_queue, model_dir: str = None):
     """
     Spawned in a separate process. Writes result or error string to result_queue.
     Imports are inside the function so the parent process doesn't need faster-whisper
@@ -51,13 +51,12 @@ def _transcribe_worker(source_path: str, output_dir: str, model_name: str, resul
     method on Windows).
     """
     try:
-        # Siemens corporate SSL proxy intercepts HTTPS; bypass cert verification
-        # for the one-time model download from HuggingFace Hub.
         os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
 
         from faster_whisper import WhisperModel
 
-        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        # model_dir allows fully offline use when HuggingFace Hub is unreachable
+        model = WhisperModel(model_dir or model_name, device="cpu", compute_type="int8")
         segments, info = model.transcribe(
             source_path,
             language="en",
@@ -161,6 +160,12 @@ def main() -> None:
     parser.add_argument("--staging", default=None,
                         help="Local folder to stage one MP4 at a time (copy-transcribe-delete). "
                              "Use when --source is a network/OneDrive path to avoid filling local disk.")
+    parser.add_argument("--model-dir", default=None,
+                        help="Path to a locally downloaded faster-whisper model folder "
+                             "(use when HuggingFace Hub is unreachable). "
+                             "Download on a connected machine: "
+                             "python -c \"from huggingface_hub import snapshot_download; "
+                             "snapshot_download('Systran/faster-whisper-small')\"")
     args = parser.parse_args()
 
     source = Path(args.source)
@@ -250,7 +255,7 @@ def main() -> None:
         result_queue = ctx.Queue()
         proc = ctx.Process(
             target=_transcribe_worker,
-            args=(str(local_file), str(output), args.model, result_queue),
+            args=(str(local_file), str(output), args.model, result_queue, args.model_dir),
             daemon=True,
         )
         proc.start()
