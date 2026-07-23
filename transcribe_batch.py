@@ -51,6 +51,10 @@ def _transcribe_worker(source_path: str, output_dir: str, model_name: str, resul
     method on Windows).
     """
     try:
+        # Siemens corporate SSL proxy intercepts HTTPS; bypass cert verification
+        # for the one-time model download from HuggingFace Hub.
+        os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
+
         from faster_whisper import WhisperModel
 
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
