@@ -50,6 +50,8 @@ RECORDINGS_PATH_RAW = os.environ.get("RECORDINGS_PATH", "").strip()
 RECORDINGS_PATH = Path(RECORDINGS_PATH_RAW) if RECORDINGS_PATH_RAW else None
 STAGING_PATH_RAW = os.environ.get("STAGING_PATH", "").strip()
 STAGING_PATH = Path(STAGING_PATH_RAW) if STAGING_PATH_RAW else (_HERE / "staging")
+WHISPER_MODEL_DIR_RAW = os.environ.get("WHISPER_MODEL_DIR", "").strip()
+WHISPER_MODEL_DIR = Path(WHISPER_MODEL_DIR_RAW) if WHISPER_MODEL_DIR_RAW else None
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +572,11 @@ def main() -> None:
         "--yes", "-y", action="store_true",
         help="Auto-confirm all prompts (required for non-interactive/background/detached runs)",
     )
+    parser.add_argument(
+        "--model-dir", default=None,
+        help="Path to a locally downloaded faster-whisper model folder "
+             "(overrides WHISPER_MODEL_DIR in .env; use when HuggingFace Hub is unreachable)",
+    )
     args = parser.parse_args()
 
     # Setup
@@ -659,6 +666,8 @@ def main() -> None:
         )
         answer = input(f"  Transcribe now before analysis? (Y/n): ").strip().lower()
         if answer != "n":
+            # Resolve model dir: CLI flag > .env > None (hub download)
+            effective_model_dir = args.model_dir or (str(WHISPER_MODEL_DIR) if WHISPER_MODEL_DIR else None)
             source_dirs = sorted({mp4.parent for mp4 in untranscribed_mp4s})
             for source_dir in source_dirs:
                 _rule(f"Transcribing {source_dir.name}")
@@ -683,6 +692,8 @@ def main() -> None:
                         "--source", str(source_dir),
                         "--output", str(source_dir),
                     ]
+                if effective_model_dir:
+                    cmd.extend(["--model-dir", effective_model_dir])
                 subprocess.run(cmd)
             # Re-scan after transcription
             new_transcripts, done_transcripts = scan_transcripts(TRANSCRIPTS_PATH)
