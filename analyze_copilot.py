@@ -86,6 +86,14 @@ HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS", "30"))
 _progress = {"current": 0, "total": 0}
 
 
+class QuotaExhaustedError(RuntimeError):
+    """Raised when the Copilot CLI reports a monthly quota exhaustion.
+
+    Propagates through all per-file/per-feature exception swallowers so the
+    outer batch loop can stop cleanly and print a resume command.
+    """
+
+
 def _progress_tag() -> str:
     if not _progress["total"]:
         return ""
@@ -252,6 +260,8 @@ def match_folders_to_features(registry: dict[str, Feature]) -> list[Path]:
     for folder in sorted(TRANSCRIPTS_PATH.iterdir()):
         if not folder.is_dir():
             continue
+        if folder.name.lower() in STANDUP_FOLDERS:
+            continue
         prefix = _extract_prefix(folder.name)
         if prefix and prefix in registry:
             registry[prefix].folder = folder
@@ -389,6 +399,10 @@ def _run_copilot(
                 stderr = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
                 stdout = stdout_path.read_text(encoding="utf-8", errors="replace").strip()
                 detail = stderr or stdout or str(exc)
+                if "exceeded your monthly quota" in detail:
+                    raise QuotaExhaustedError(
+                        f"Copilot monthly quota exhausted. {detail}"
+                    ) from exc
                 raise RuntimeError(
                     f"Copilot CLI request failed: {detail}"
                 ) from exc
@@ -1125,6 +1139,8 @@ def analyze_transcript(vtt: Path, bu: str, system: str, qc_threshold: int = 0) -
         _try_record_failure(meta_out, source_sig, system_sig, qc_threshold, "timeout", str(e))
         log_needs_followup(bu, vtt.name, f"TIMEOUT: {e}")
         return None
+    except QuotaExhaustedError:
+        raise
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         _try_record_failure(meta_out, source_sig, system_sig, qc_threshold, "error", str(e))
@@ -1161,6 +1177,8 @@ def summarize_bu(bu: str, analyses: list[str], system: str) -> None:
         _safe_write_text(out, result, encoding="utf-8")
         print("done")
         time.sleep(RATE_LIMIT_SLEEP)
+    except QuotaExhaustedError:
+        raise
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         log_needs_followup(bu, "[BU SUMMARY]", f"ERROR: {e}")
@@ -1193,6 +1211,8 @@ def process_bu(
             # and keep processing the remaining transcripts/BUs.
             try:
                 result = analyze_transcript(vtt, bu, system, qc_threshold=qc_threshold)
+            except QuotaExhaustedError:
+                raise
             except Exception as e:
                 print(f"  [ERROR] unexpected failure analyzing {vtt.name}: {e}", file=sys.stderr)
                 log_needs_followup(bu, vtt.name, f"UNEXPECTED ERROR: {e}")
@@ -1445,6 +1465,8 @@ def uc_analyze_transcript(
         })
         log_needs_followup(key, transcript.name, f"TIMEOUT: {e}")
         return None
+    except QuotaExhaustedError:
+        raise
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         _write_meta(meta_out, {
@@ -1488,6 +1510,8 @@ def uc_summarize_feature(
         print("done")
         time.sleep(RATE_LIMIT_SLEEP)
         return result
+    except QuotaExhaustedError:
+        raise
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return None
@@ -1514,6 +1538,8 @@ def uc_summarize_uc(uc: str, feature_summaries: list[tuple[str, str]], base_cont
         out.write_text(result, encoding="utf-8")
         print("done")
         time.sleep(RATE_LIMIT_SLEEP)
+    except QuotaExhaustedError:
+        raise
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
 
@@ -1521,6 +1547,28 @@ def uc_summarize_uc(uc: str, feature_summaries: list[tuple[str, str]], base_cont
 # ===========================================================================
 # UC Pipeline — gap report (no API calls)
 # ===========================================================================
+
+def _feature_status(tc: int, ac: int, has_summary: bool) -> str:
+    """Return a concise status label for one feature."""
+    if tc == 0:
+        return "no folder"
+    if ac == 0:
+        return "not started"
+    if ac < tc or not has_summary:
+        return "partial"
+    return "clean"
+
+
+def _has_feature_summary(feat: Feature) -> bool:
+    key = _feat_key(feat)
+    d = FEATURES_OUT / key
+    if not d.exists():
+        return False
+    return any(
+        p.name.startswith("[FEATURE SUMMARY]") and p.suffix == ".md"
+        for p in d.iterdir()
+    )
+
 
 def generate_gap_report(registry: dict[str, Feature], unmatched_folders: list[Path]) -> None:
     out = gap_report_path()
@@ -1542,21 +1590,46 @@ def generate_gap_report(registry: dict[str, Feature], unmatched_folders: list[Pa
             return 0
         return sum(1 for p in d.iterdir() if "[ANALYZED]" in p.name and p.suffix == ".txt")
 
+    total_standups = count_top_level_standups()
+
+    counts = {
+        "clean": 0, "partial": 0, "not started": 0, "no folder": 0,
+    }
+    for feat in features:
+        tc = transcript_count(feat)
+        ac = analysis_count(feat)
+        has_sum = _has_feature_summary(feat)
+        s = _feature_status(tc, ac, has_sum)
+        counts[s] += 1
+
     lines: list[str] = [
         "# Coverage Gap Report\n",
         f"Generated: {datetime.now(UTC).isoformat()}  ",
         f"Total features in backlog: **{len(features)}**  ",
         f"Features with transcript folders: **{len(with_folder)}**  ",
-        f"Features without transcript folders: **{len(without_folder)}**\n",
+        f"Features without transcript folders: **{len(without_folder)}**  ",
+        f"Standups sequestered (excluded from analysis): **{total_standups}**\n",
+        "**Analysis status:** "
+        f"✓ clean: {counts['clean']}  |  "
+        f"~ partial: {counts['partial']}  |  "
+        f"○ not started: {counts['not started']}  |  "
+        f"✗ no folder: {counts['no folder']}\n",
         "## Coverage Matrix\n",
-        "| Feature | ARM Capability | UC0 | UC1 | UC2 | Transcripts | Analyzed |",
-        "|---------|---------------|-----|-----|-----|-------------|----------|",
+        "| Feature | ARM Capability | UC0 | UC1 | UC2 | Transcripts | Analyzed | Status |",
+        "|---------|---------------|-----|-----|-----|-------------|----------|--------|",
     ]
 
     for feat in sorted(features, key=lambda f: (f.prefix or "z", f.arm_name)):
         tc = transcript_count(feat)
         ac = analysis_count(feat)
-        status = f"{ac}/{tc}" if tc else "**NO COVERAGE**"
+        has_sum = _has_feature_summary(feat)
+        status = _feature_status(tc, ac, has_sum)
+        status_cell = {
+            "clean": "✓ clean",
+            "partial": "~ partial",
+            "not started": "○ not started",
+            "no folder": "✗ no folder",
+        }[status]
         lines.append(
             f"| {feat.prefix or '-'} "
             f"| {feat.arm_name} "
@@ -1564,7 +1637,8 @@ def generate_gap_report(registry: dict[str, Feature], unmatched_folders: list[Pa
             f"| {feat.scope_label('UC1')} "
             f"| {feat.scope_label('UC2')} "
             f"| {tc} "
-            f"| {status} |"
+            f"| {ac}/{tc} "
+            f"| {status_cell} |"
         )
 
     # Priority gaps: in-scope for at least one UC, no transcripts
@@ -1572,6 +1646,22 @@ def generate_gap_report(registry: dict[str, Feature], unmatched_folders: list[Pa
         f for f in without_folder
         if any(f.in_scope(uc) for uc in ("UC0", "UC1", "UC2"))
     ]
+
+    lines.append("\n## Needs Attention\n")
+    partial = [f for f in features if _feature_status(transcript_count(f), analysis_count(f), _has_feature_summary(f)) == "partial"]
+    not_started_with_folder = [f for f in with_folder if _feature_status(transcript_count(f), analysis_count(f), _has_feature_summary(f)) == "not started"]
+    if partial:
+        lines.append("### Partially analyzed (transcripts exist but run incomplete)\n")
+        for feat in sorted(partial, key=lambda f: (f.prefix or "z")):
+            tc = transcript_count(feat)
+            ac = analysis_count(feat)
+            has_sum = _has_feature_summary(feat)
+            detail = f"{ac}/{tc} transcripts analyzed" + ("" if has_sum else ", no summary yet")
+            lines.append(f"- **{feat.display_name}** — {detail} → `--feature {feat.prefix}`")
+    if not_started_with_folder:
+        lines.append("\n### Folder exists but not yet analyzed\n")
+        for feat in sorted(not_started_with_folder, key=lambda f: (f.prefix or "z")):
+            lines.append(f"- **{feat.display_name}** → `--feature {feat.prefix}`")
 
     lines.append("\n## Priority Gaps (in-scope, no recordings)\n")
     if in_scope_no_coverage:
@@ -1600,13 +1690,69 @@ def generate_gap_report(registry: dict[str, Feature], unmatched_folders: list[Pa
     print(f"  [gap report] written -> {out}")
 
 
+def print_run_status_table(registry: dict[str, Feature]) -> None:
+    """Print a compact feature-by-feature status table to the terminal."""
+    features = sorted(registry.values(), key=lambda f: (f.prefix or "z", f.arm_name))
+
+    def tc(feat: Feature) -> int:
+        if feat.folder is None:
+            return 0
+        return sum(1 for p in feat.folder.iterdir()
+                   if p.is_file() and p.suffix.lower() in (".vtt", ".txt"))
+
+    def ac(feat: Feature) -> int:
+        d = FEATURES_OUT / _feat_key(feat)
+        if not d.exists():
+            return 0
+        return sum(1 for p in d.iterdir() if "[ANALYZED]" in p.name and p.suffix == ".txt")
+
+    rows = []
+    for feat in features:
+        t = tc(feat)
+        a = ac(feat)
+        has_sum = _has_feature_summary(feat)
+        status = _feature_status(t, a, has_sum)
+        rows.append((feat.prefix or "-", feat.arm_name, t, a, status))
+
+    col_w = max((len(r[1]) for r in rows), default=20)
+    header = f"  {'#':<6}  {'Feature':<{col_w}}  {'Trans':>5}  {'Done':>4}  Status"
+    sep = "  " + "-" * (len(header) - 2)
+    standups = count_top_level_standups()
+    print(f"\n=== Feature Analysis Status ==={f'  ({standups} standups sequestered)' if standups else ''}")
+    print(header)
+    print(sep)
+    for prefix, name, t, a, status in rows:
+        marker = {"clean": "✓", "partial": "~", "not started": "○", "no folder": "✗"}[status]
+        print(f"  {prefix:<6}  {name:<{col_w}}  {t:>5}  {a:>4}  {marker} {status}")
+    print(sep)
+    counts = {"clean": 0, "partial": 0, "not started": 0, "no folder": 0}
+    for *_, status in rows:
+        counts[status] += 1
+    print(f"  ✓ clean: {counts['clean']}  ~ partial: {counts['partial']}  ○ not started: {counts['not started']}  ✗ no folder: {counts['no folder']}")
+    print()
+
+
 # ===========================================================================
 # UC Pipeline — main entry point
 # ===========================================================================
 
+STANDUP_FOLDERS = {"standups", "standup", "status", "weekly"}
+
+
 def _find_transcripts(folder: Path) -> list[Path]:
+    """Return transcript files directly in folder, excluding standup subfolders."""
     return sorted(p for p in folder.iterdir()
                   if p.is_file() and p.suffix.lower() in (".vtt", ".txt"))
+
+
+def count_top_level_standups() -> int:
+    """Count transcripts in top-level standup folders under TRANSCRIPTS_PATH."""
+    total = 0
+    for folder in TRANSCRIPTS_PATH.iterdir():
+        if folder.is_dir() and folder.name.lower() in STANDUP_FOLDERS:
+            total += sum(1 for p in folder.iterdir()
+                         if p.is_file() and p.suffix.lower() in (".vtt", ".txt"))
+    return total
 
 
 def run_uc_pipeline(
@@ -1656,6 +1802,8 @@ def run_uc_pipeline(
     if gap_only:
         print("\n=== Generating gap report ===")
         generate_gap_report(registry, unmatched)
+        if registry:
+            print_run_status_table(registry)
         return
 
     if qc_only:
@@ -1692,6 +1840,7 @@ def run_uc_pipeline(
             uc_summarize_feature(feat, analyses, base_context, 1, 1)
         print("\n=== Generating gap report ===")
         generate_gap_report(registry, unmatched)
+        print_run_status_table(registry)
         return
 
     # Full pipeline: all features → UC rollups → gap report
@@ -1703,66 +1852,91 @@ def run_uc_pipeline(
     print(f"\n=== Analyzing transcripts across {feat_total} features ===")
 
     feature_summaries_by_uc: dict[str, list[tuple[str, str]]] = {uc: [] for uc in UC_NAMES}
+    last_feature_key: str | None = None
 
-    for feat_num, (key, feat) in enumerate(features_with_folders, 1):
-        transcripts = _find_transcripts(feat.folder)
-        feat_counter = f"[{feat_num}/{feat_total}]"
-        print(f"\n  {feat_counter} Feature: {feat.display_name} — {len(transcripts)} transcript(s)")
+    try:
+        for feat_num, (key, feat) in enumerate(features_with_folders, 1):
+            last_feature_key = key
+            transcripts = _find_transcripts(feat.folder)
+            feat_counter = f"[{feat_num}/{feat_total}]"
+            print(f"\n  {feat_counter} Feature: {feat.display_name} — {len(transcripts)} transcript(s)")
 
-        analyses = []
-        if summary_only:
-            for p in sorted((FEATURES_OUT / key).iterdir()):
-                if "[ANALYZED]" in p.name and p.suffix == ".txt":
-                    analyses.append(p.read_text(encoding="utf-8"))
-            if not analyses:
-                print(f"    [warn] no existing analyses found for {feat.display_name}")
-        else:
-            for i, t in enumerate(transcripts, 1):
-                result = uc_analyze_transcript(
-                    t, feat, base_context, solution_prompt, qc_threshold,
-                    counter=f"[{i}/{len(transcripts)}]",
-                )
-                if result:
-                    analyses.append(result)
-
-        if analyses:
-            summary = uc_summarize_feature(feat, analyses, base_context, feat_num, feat_total)
-            if summary:
-                for uc in UC_NAMES:
-                    if feat.in_scope(uc):
-                        feature_summaries_by_uc[uc].append((feat.display_name, summary))
-
-    if unmatched:
-        print(f"\n=== Processing {len(unmatched)} unmatched folders ===")
-        for i, folder in enumerate(unmatched, 1):
-            synthetic = Feature(
-                prefix="", arm_name=folder.name, siemens_name=folder.name,
-                definition="No backlog feature mapping. Extract requirements, decisions, and open items.",
-                uc0_scope="", uc1_scope="", uc2_scope="", sf_owner="", folder=folder,
-            )
-            transcripts = _find_transcripts(folder)
-            print(f"\n  [{i}/{len(unmatched)}] Unmatched: {folder.name} — {len(transcripts)} transcript(s)")
             analyses = []
-            if not summary_only:
-                for j, t in enumerate(transcripts, 1):
+            if summary_only:
+                for p in sorted((FEATURES_OUT / key).iterdir()):
+                    if "[ANALYZED]" in p.name and p.suffix == ".txt":
+                        analyses.append(p.read_text(encoding="utf-8"))
+                if not analyses:
+                    print(f"    [warn] no existing analyses found for {feat.display_name}")
+            else:
+                for i, t in enumerate(transcripts, 1):
                     result = uc_analyze_transcript(
-                        t, synthetic, base_context, solution_prompt, qc_threshold,
-                        counter=f"[{j}/{len(transcripts)}]",
+                        t, feat, base_context, solution_prompt, qc_threshold,
+                        counter=f"[{i}/{len(transcripts)}]",
                     )
                     if result:
                         analyses.append(result)
-            if analyses:
-                uc_summarize_feature(synthetic, analyses, base_context, i, len(unmatched))
 
-    print("\n=== Generating UC summaries ===")
-    for uc, summaries in feature_summaries_by_uc.items():
-        if summaries:
-            uc_summarize_uc(uc, summaries, base_context)
-        else:
-            print(f"  [skip] {uc} — no feature summaries available")
+            if analyses:
+                summary = uc_summarize_feature(feat, analyses, base_context, feat_num, feat_total)
+                if summary:
+                    for uc in UC_NAMES:
+                        if feat.in_scope(uc):
+                            feature_summaries_by_uc[uc].append((feat.display_name, summary))
+
+        if unmatched:
+            print(f"\n=== Processing {len(unmatched)} unmatched folders ===")
+            for i, folder in enumerate(unmatched, 1):
+                synthetic = Feature(
+                    prefix="", arm_name=folder.name, siemens_name=folder.name,
+                    definition="No backlog feature mapping. Extract requirements, decisions, and open items.",
+                    uc0_scope="", uc1_scope="", uc2_scope="", sf_owner="", folder=folder,
+                )
+                transcripts = _find_transcripts(folder)
+                print(f"\n  [{i}/{len(unmatched)}] Unmatched: {folder.name} — {len(transcripts)} transcript(s)")
+                analyses = []
+                if not summary_only:
+                    for j, t in enumerate(transcripts, 1):
+                        result = uc_analyze_transcript(
+                            t, synthetic, base_context, solution_prompt, qc_threshold,
+                            counter=f"[{j}/{len(transcripts)}]",
+                        )
+                        if result:
+                            analyses.append(result)
+                if analyses:
+                    uc_summarize_feature(synthetic, analyses, base_context, i, len(unmatched))
+
+        print("\n=== Generating UC summaries ===")
+        for uc, summaries in feature_summaries_by_uc.items():
+            if summaries:
+                uc_summarize_uc(uc, summaries, base_context)
+            else:
+                print(f"  [skip] {uc} — no feature summaries available")
+
+    except QuotaExhaustedError as e:
+        print(f"\n\n[QUOTA EXHAUSTED] {e}", file=sys.stderr)
+        print(
+            "\nThe Copilot monthly quota was hit mid-run. All work completed so far has been saved.",
+            file=sys.stderr,
+        )
+        if last_feature_key:
+            print(
+                f"\nTo resume when your quota resets, run:\n"
+                f"  python analyze_copilot.py --uc --feature {last_feature_key}\n"
+                f"(that feature may be partially done; it will reprocess only changed/missing transcripts)",
+                file=sys.stderr,
+            )
+        print("\n=== Generating gap report from work completed so far ===")
+        generate_gap_report(registry, unmatched)
+        if registry:
+            print_run_status_table(registry)
+        sys.exit(1)
 
     print("\n=== Generating gap report ===")
     generate_gap_report(registry, unmatched)
+
+    if registry:
+        print_run_status_table(registry)
 
     print("\nAll done.")
 
@@ -1855,20 +2029,31 @@ def main() -> None:
         bu_names = sorted(bus)
         bu_total = len(bu_names)
         _progress["total"] = total_transcripts
-        for i, bu_name in enumerate(bu_names, 1):
-            print(f"\n[{i}/{bu_total}] BU: {bu_name}")
-            try:
-                process_bu(
-                    bu_name,
-                    bus[bu_name],
-                    system,
-                    summary_only=args.summary_only,
-                    transcript_only=args.transcript_only,
-                    qc_threshold=args.qc_threshold,
-                )
-            except Exception as e:
-                print(f"\n[ERROR] BU '{bu_name}' failed unexpectedly: {e}", file=sys.stderr)
-                log_needs_followup(bu_name, "[BU]", f"UNEXPECTED BU ERROR: {e}")
+        try:
+            for i, bu_name in enumerate(bu_names, 1):
+                print(f"\n[{i}/{bu_total}] BU: {bu_name}")
+                try:
+                    process_bu(
+                        bu_name,
+                        bus[bu_name],
+                        system,
+                        summary_only=args.summary_only,
+                        transcript_only=args.transcript_only,
+                        qc_threshold=args.qc_threshold,
+                    )
+                except QuotaExhaustedError:
+                    raise
+                except Exception as e:
+                    print(f"\n[ERROR] BU '{bu_name}' failed unexpectedly: {e}", file=sys.stderr)
+                    log_needs_followup(bu_name, "[BU]", f"UNEXPECTED BU ERROR: {e}")
+        except QuotaExhaustedError as e:
+            print(f"\n\n[QUOTA EXHAUSTED] {e}", file=sys.stderr)
+            print(
+                "\nThe Copilot monthly quota was hit mid-run. All work completed so far has been saved.\n"
+                "Re-run when your quota resets — resume safety will skip already-analyzed transcripts.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     print("\nAll done.")
 
