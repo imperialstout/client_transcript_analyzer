@@ -577,6 +577,18 @@ def main() -> None:
         help="Path to a locally downloaded faster-whisper model folder "
              "(overrides WHISPER_MODEL_DIR in .env; use when HuggingFace Hub is unreachable)",
     )
+    parser.add_argument(
+        "--triage", metavar="FOLDER",
+        help="Classify all transcripts in FOLDER against the feature registry and write a routing report",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="With --triage: show what would be copied without actually copying",
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="With --triage: copy transcripts into feature subfolders under TRANSCRIPTS_PATH",
+    )
     args = parser.parse_args()
 
     # Setup
@@ -598,6 +610,16 @@ def main() -> None:
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
     _rule("Transcript Analyzer")
+
+    # Triage shortcut — classify a dump folder against the feature registry
+    if args.triage:
+        triage_args = ["--triage", args.triage]
+        if args.dry_run:
+            triage_args.append("--dry-run")
+        if args.apply:
+            triage_args.append("--apply")
+        _run_script(triage_args)
+        return
 
     # Gap-only shortcut — pure data, no API calls
     if args.gap_only:
