@@ -1942,6 +1942,255 @@ def run_uc_pipeline(
 
 
 # ===========================================================================
+# Triage pipeline — classify a dump folder and route transcripts to features
+# ===========================================================================
+
+_TRIAGE_MAX_TRANSCRIPT_CHARS = 8_000  # chars fed to classifier per transcript
+
+
+def _build_triage_prompt(transcript_snippet: str, features: list[Feature]) -> str:
+    feature_list = "\n".join(
+        f"  {f.prefix or '-'} | {f.display_name}"
+        + (f" — {f.definition[:120]}" if f.definition else "")
+        for f in features
+    )
+    return (
+        "You are classifying a meeting transcript excerpt to determine which backlog features "
+        "it meaningfully covers. A transcript 'meaningfully covers' a feature if it discusses "
+        "requirements, decisions, constraints, or open questions relevant to that feature — not "
+        "just a passing mention.\n\n"
+        "FEATURE REGISTRY (prefix | name — definition):\n"
+        f"{feature_list}\n\n"
+        "TRANSCRIPT EXCERPT:\n"
+        f"{transcript_snippet}\n\n"
+        "Reply with ONLY a JSON object in this exact format (no markdown, no explanation):\n"
+        '{"features": ["1.04", "2.01"], "confidence": "high|medium|low", '
+        '"meeting_type": "discovery|design|standup|demo|other", "summary": "one sentence"}\n\n'
+        'Use an empty list [] if no features are meaningfully covered. '
+        '"confidence" reflects how clear the mapping is. '
+        '"meeting_type" is your best read of what kind of call this was.'
+    )
+
+
+def _parse_triage_response(raw: str) -> dict:
+    raw = raw.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        raw = raw.strip()
+    try:
+        result = json.loads(raw)
+        if not isinstance(result.get("features"), list):
+            result["features"] = []
+        result.setdefault("confidence", "low")
+        result.setdefault("meeting_type", "other")
+        result.setdefault("summary", "")
+        return result
+    except Exception:
+        return {"features": [], "confidence": "low", "meeting_type": "other", "summary": raw[:120]}
+
+
+def triage_report_path(dump_folder: Path) -> Path:
+    safe = re.sub(r'[<>:"/\\|?*]', "-", dump_folder.name)
+    return OUTPUT_PATH / f"[TRIAGE REPORT] {safe}.md"
+
+
+def run_triage(
+    dump_folder: Path,
+    apply: bool = False,
+    dry_run: bool = False,
+) -> None:
+    if not dump_folder.exists():
+        sys.exit(f"Triage folder not found: {dump_folder}")
+
+    missing_csvs = [p for p in required_csv_paths() if not p.exists()]
+    if missing_csvs:
+        sys.exit(
+            "Required backlog CSV files are missing. Place them under client_data/.\n"
+            "Missing:\n" + "\n".join(f"- {p}" for p in missing_csvs)
+        )
+
+    registry = load_feature_registry()
+    features = sorted(registry.values(), key=lambda f: (f.prefix or "z", f.arm_name))
+    print(f"Loaded {len(features)} features from backlog CSVs.")
+
+    transcripts = sorted(
+        p for p in dump_folder.iterdir()
+        if p.is_file() and p.suffix.lower() in (".vtt", ".txt")
+    )
+    if not transcripts:
+        sys.exit(f"No .vtt or .txt files found in {dump_folder}")
+
+    print(f"Found {len(transcripts)} transcripts to triage in: {dump_folder}")
+    print()
+
+    results: list[dict] = []
+    for i, t in enumerate(transcripts, 1):
+        print(f"  [{i}/{len(transcripts)}] {t.name} ...", end=" ", flush=True)
+        try:
+            text = transcript_to_text(t)
+            snippet = text[:_TRIAGE_MAX_TRANSCRIPT_CHARS]
+            prompt = _build_triage_prompt(snippet, features)
+            raw = _run_copilot(prompt=prompt, model=MODEL_TRANSCRIPT)
+            parsed = _parse_triage_response(raw)
+            parsed["path"] = t
+            parsed["name"] = t.name
+            feature_labels = []
+            for prefix in parsed["features"]:
+                feat = registry.get(prefix)
+                if feat:
+                    feature_labels.append(f"{prefix} {feat.display_name}")
+                else:
+                    feature_labels.append(prefix)
+            parsed["feature_labels"] = feature_labels
+            results.append(parsed)
+            tag = f"{parsed['meeting_type']} / {parsed['confidence']}"
+            mapped = ", ".join(parsed["feature_labels"]) if parsed["feature_labels"] else "none"
+            print(f"{tag} → {mapped}")
+            time.sleep(RATE_LIMIT_SLEEP)
+        except QuotaExhaustedError:
+            raise
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            results.append({
+                "path": t, "name": t.name, "features": [], "feature_labels": [],
+                "confidence": "error", "meeting_type": "other",
+                "summary": f"Classification failed: {e}",
+            })
+
+    _write_triage_report(results, registry, dump_folder, apply, dry_run)
+
+    if apply or dry_run:
+        _apply_triage(results, registry, dump_folder, dry_run=dry_run)
+
+
+def _write_triage_report(
+    results: list[dict],
+    registry: dict[str, Feature],
+    dump_folder: Path,
+    apply: bool,
+    dry_run: bool,
+) -> None:
+    out = triage_report_path(dump_folder)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    mapped = [r for r in results if r["features"]]
+    unmapped = [r for r in results if not r["features"] and r["confidence"] != "error"]
+    errors = [r for r in results if r["confidence"] == "error"]
+    standups = [r for r in results if r.get("meeting_type") == "standup"]
+
+    lines: list[str] = [
+        f"# Triage Report — {dump_folder.name}",
+        "",
+        f"Generated: {datetime.now(UTC).isoformat()}  ",
+        f"Source folder: `{dump_folder}`  ",
+        f"Transcripts scanned: **{len(results)}**  ",
+        f"Mapped to features: **{len(mapped)}**  ",
+        f"No feature match: **{len(unmapped)}**  ",
+        f"Standups: **{len(standups)}**  ",
+        f"Errors: **{len(errors)}**",
+        "",
+    ]
+
+    if apply:
+        lines.append("_Files have been copied to feature folders (`--apply`)._")
+    elif dry_run:
+        lines.append("_Dry run — no files were copied (`--dry-run`). Re-run with `--apply` to copy._")
+    else:
+        lines.append("_Report only — no files were copied. Re-run with `--apply` to copy files to feature folders._")
+    lines.append("")
+
+    # Mapped transcripts
+    lines += ["## Mapped Transcripts", ""]
+    lines += ["| Transcript | Features | Type | Confidence | Summary |",
+               "|-----------|---------|------|-----------|---------|"]
+    for r in sorted(mapped, key=lambda x: x["name"]):
+        feats = ", ".join(r["feature_labels"])
+        lines.append(
+            f"| {r['name']} | {feats} | {r.get('meeting_type','?')} "
+            f"| {r['confidence']} | {r.get('summary','')} |"
+        )
+
+    # Unmapped
+    lines += ["", "## No Feature Match", ""]
+    if unmapped:
+        lines += ["| Transcript | Type | Summary |",
+                   "|-----------|------|---------|"]
+        for r in sorted(unmapped, key=lambda x: x["name"]):
+            lines.append(
+                f"| {r['name']} | {r.get('meeting_type','?')} | {r.get('summary','')} |"
+            )
+    else:
+        lines.append("_All transcripts mapped to at least one feature._")
+
+    # Errors
+    if errors:
+        lines += ["", "## Classification Errors", ""]
+        for r in errors:
+            lines.append(f"- **{r['name']}**: {r.get('summary','')}")
+
+    # Per-feature summary
+    lines += ["", "## Coverage by Feature", ""]
+    feature_hits: dict[str, list[str]] = {}
+    for r in results:
+        for prefix in r.get("features", []):
+            feature_hits.setdefault(prefix, []).append(r["name"])
+
+    all_features = sorted(registry.values(), key=lambda f: (f.prefix or "z", f.arm_name))
+    lines += ["| Feature | Transcripts Routed |",
+               "|--------|-------------------|"]
+    for feat in all_features:
+        key = feat.prefix or re.sub(r"[^a-z0-9]+", "-", feat.arm_name.lower()).strip("-")
+        hits = feature_hits.get(key, [])
+        cell = ", ".join(hits) if hits else "_none_"
+        lines.append(f"| {feat.prefix or '-'} {feat.display_name} | {cell} |")
+
+    _safe_write_text(out, "\n".join(lines) + "\n")
+    print(f"\n  [triage report] written -> {out}")
+
+
+def _apply_triage(
+    results: list[dict],
+    registry: dict[str, Feature],
+    dump_folder: Path,
+    dry_run: bool,
+) -> None:
+    label = "[dry-run]" if dry_run else "[copy]"
+    copied = 0
+    skipped = 0
+
+    for r in results:
+        if not r.get("features"):
+            continue
+        src: Path = r["path"]
+        for prefix in r["features"]:
+            feat = registry.get(prefix)
+            if not feat:
+                continue
+            # Use existing folder name if already present, else construct one
+            folder_name = feat.folder.name if feat.folder else (
+                f"{feat.prefix} {feat.display_name}" if feat.prefix else feat.display_name
+            )
+            dest_dir = TRANSCRIPTS_PATH / folder_name
+            dest = dest_dir / src.name
+            if dest.exists():
+                print(f"  {label} SKIP (exists) {src.name} → {folder_name}/")
+                skipped += 1
+                continue
+            print(f"  {label} {src.name} → {folder_name}/")
+            if not dry_run:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dest))
+            copied += 1
+
+    action = "Would copy" if dry_run else "Copied"
+    print(f"\n  {action} {copied} file(s), skipped {skipped} (already present).")
+    if dry_run:
+        print("  Re-run with --apply to perform the actual copies.")
+
+
+# ===========================================================================
 # BU Pipeline main()
 # ===========================================================================
 
@@ -1963,10 +2212,24 @@ def main() -> None:
                         help="Minimum QC score required before transcript analysis runs; 0 disables gating")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the startup Copilot CLI connectivity/auth check (not recommended)")
+    parser.add_argument("--triage", metavar="FOLDER",
+                        help="Classify all transcripts in FOLDER against the feature registry and write a routing report")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --triage: show what would be copied without actually copying")
+    parser.add_argument("--apply", action="store_true",
+                        help="With --triage: copy transcripts into feature subfolders under TRANSCRIPTS_PATH")
     args = parser.parse_args()
 
     if args.qc_threshold < 0 or args.qc_threshold > 100:
         sys.exit("--qc-threshold must be between 0 and 100")
+
+    if args.triage:
+        run_triage(
+            dump_folder=Path(args.triage),
+            apply=args.apply,
+            dry_run=args.dry_run,
+        )
+        return
 
     # Route to UC pipeline when --uc is set
     if args.uc or args.gap_only or args.feature:
